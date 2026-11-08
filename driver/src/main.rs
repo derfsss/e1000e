@@ -848,6 +848,7 @@ impl Net {
             head_reads: 0,
             buf_size,
             unkicked_n: 0,
+            last_big: false,
         };
         tx.start();
         u.tx_idle.store(1, Ordering::Release);
@@ -1368,6 +1369,8 @@ struct TxRing {
     buf_size: usize,
     /// Frames filled since the last tail write (batching).
     unkicked_n: u32,
+    /// The last frame filled was a jumbo frame (batching never holds one).
+    last_big: bool,
 }
 
 impl TxRing {
@@ -1493,7 +1496,8 @@ impl TxRing {
         self.tail = (i + 1) % self.n;
         self.unkicked = true;
         self.unkicked_n += 1;
-        if frame_len > eth::HLEN + eth::MTU {
+        self.last_big = frame_len > eth::HLEN + eth::MTU;
+        if self.last_big {
             u.jumbo_tx.fetch_add(1, Ordering::Relaxed);
         }
         u.count(perf::TX_PUBLISH);
@@ -1520,10 +1524,15 @@ impl TxRing {
             if u.tune.load(Ordering::Relaxed) & TUNE_TX_BATCH != 0
                 && u.tx_idle.load(Ordering::Acquire) == 0
                 && self.unkicked_n < TX_BATCH_MAX
+                && !self.last_big
             {
                 // The card is still sending: these frames go with the next
                 // tail write (at TXQE, through the unit task, or once
-                // TX_BATCH_MAX wait).
+                // TX_BATCH_MAX wait). Only normal-size frames wait: a few
+                // jumbo frames fill a TCP window long before TX_BATCH_MAX,
+                // and each burst would then wait for the TXQE interrupt
+                // (MTU 9000 between two QEMU machines fell from ~15 to
+                // ~2 MB/s). A jumbo frame sends at once, with what waits.
                 u.count(perf::TX_DEFERRED);
                 return;
             }
