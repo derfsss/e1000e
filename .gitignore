@@ -1,0 +1,24 @@
+# Rust build output
+target/
+
+# C objects from the Makefile
+build/
+
+# Linked AmigaOS binary
+driver/e1000e.device
+
+# Built packages
+dist/
+
+# Editor / OS state
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local working notes (not published)
+CLAUDE.md
+diag/e1000e_diag
+driver/e1000e_diag.device
+driver/build-diag/

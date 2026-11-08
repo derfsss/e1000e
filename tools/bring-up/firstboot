@@ -1,0 +1,31 @@
+.key DIR/A,MYIP/A,GWIP/A
+.bra {
+.ket }
+; First run of the e1000e driver on a real machine (written for the X5000),
+; with the diag build. Nothing here starts at boot and no TCP/IP stack is
+; touched, so the machine's own network (and anything reaching it
+; remotely) is unaffected.
+;
+;   Execute firstboot <dir> <myip> <gwip>
+;
+; <dir>  holds e1000e_diag.device, e1000e_diag and s2test; the reports are
+;        written there too (firstboot-*.txt, and firstboot-ramlog.txt from
+;        RAM:e1000e_diag.log).
+; <myip> a free address on the card's network, for s2test's ARP and ping
+; <gwip> a machine that answers ARP and ping on that network
+FailAt 30
+Copy {DIR}/e1000e_diag C: QUIET
+Protect C:e1000e_diag +rwed QUIET
+Echo "1/4 the card before the driver runs (e1000e_diag RAW FULL)"
+C:e1000e_diag RAW FULL >{DIR}/firstboot-raw.txt
+Type {DIR}/firstboot-raw.txt
+Echo "2/4 the driver into DEVS:Networks/"
+Copy {DIR}/e1000e_diag.device DEVS:Networks/ QUIET
+Echo "3/4 s2test on unit 0 (32 checks; needs a cable and {GWIP} answering)"
+{DIR}/s2test 0 networks/e1000e_diag.device {MYIP} {GWIP} >{DIR}/firstboot-s2test.txt
+Type {DIR}/firstboot-s2test.txt
+Echo "4/4 the settings and the driver's own report (e1000e_diag)"
+C:e1000e_diag >{DIR}/firstboot-diag.txt
+Type {DIR}/firstboot-diag.txt
+Copy RAM:e1000e_diag.log {DIR}/firstboot-ramlog.txt QUIET
+Echo "Done. Reports in {DIR}: firstboot-raw.txt, -s2test.txt, -diag.txt, -ramlog.txt"

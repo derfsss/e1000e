@@ -1,0 +1,23 @@
+[package]
+name = "e1000ediag"
+version = "0.1.0"
+edition = "2021"
+authors = ["Richard Gibbs <rich_gibbs@hotmail.com>"]
+license = "MIT"
+autobins = false
+
+[lib]
+name = "e1000ediag"
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[dependencies]
+amigaos4 = { path = "../amigaos4", default-features = false, features = ["pci", "timer", "dos", "device", "sana2"] }

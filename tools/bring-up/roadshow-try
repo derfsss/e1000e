@@ -1,0 +1,19 @@
+.key ADDR/A,MASK/A,DEVICE/K
+; Add the e1000e driver's unit 0 to Roadshow for this boot only, with a
+; fixed address and no DHCP (DHCP would install a second default route and
+; can take the machine's own connection away). A reboot removes it.
+;
+;   Execute roadshow-try <address> <netmask> [DEVICE=e1000e.device]
+;
+; The device is the diag build (e1000e_diag.device) unless DEVICE= names
+; another. Use an address on a network that is NOT the one the machine's
+; own port is on (two interfaces on one subnet confuse the routing), for
+; example a direct cable to a PC's second port. Then measure with netprof
+; against netprof-host on that PC: netprof recv <pc address> iface=E1000E
+FailAt 30
+Echo >RAM:E1000E "device=<DEVICE$e1000e_diag.device>"
+Echo >>RAM:E1000E "unit=0"
+Echo >>RAM:E1000E "address=<ADDR>"
+Echo >>RAM:E1000E "netmask=<MASK>"
+AddNetInterface RAM:E1000E TIMEOUT=20
+ShowNetStatus

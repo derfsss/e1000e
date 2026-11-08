@@ -1,0 +1,33 @@
+[package]
+name = "e1000e"
+version = "0.1.0"
+edition = "2021"
+authors = ["Richard Gibbs <rich_gibbs@hotmail.com>"]
+license = "MIT"
+autobins = false
+
+[lib]
+name = "e1000e"
+crate-type = ["staticlib"]
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[dependencies]
+amigaos4 = { path = "../amigaos4", default-features = false, features = ["pci", "timer", "device", "sana2"] }
+
+[features]
+# Detailed serial logging for bring-up on a new machine: ring and
+# interrupt state once a second while the unit runs.
+debug-log = []
+
+# The diag build: e1000e_diag.device with the private diagnostic, tuning
+# and test commands, transmit batching, jumbo frames (ENV:e1000e_diag/MTU)
+# and the extras log in RAM:e1000e_diag.log. Link with make DIAG=1.
+diag = ["amigaos4/dos"]
