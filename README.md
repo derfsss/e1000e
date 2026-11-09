@@ -56,10 +56,20 @@ The installer only copies files. It does not change your network settings.
 The Internet connection wizard (`SYS:Internet/New Connection`) sets the
 card up:
 
-1. Choose **Local Area Network**.
-2. When it asks for the network device, choose `e1000e.device` (or
-   `e1000e_diag.device` for the diagnostics build), unit **0**.
-3. Let it get an address automatically (DHCP), or enter your own.
+1. Choose **Local Area Network (DSL/LAN/Router/Switch/Hub)** and click
+   **Next**.
+2. Choose **Manual configuration** and click **Next**. (The card is not in
+   the wizard's list of known cards, so automatic configuration won't
+   find it.)
+3. In the **Name** box below the list, type `e1000e.device` (or
+   `e1000e_diag.device` for the diagnostics build), or click the button
+   beside it to pick the file from `DEVS:Networks`. Leave **Port** at
+   **0** and ignore the speed slider. You can click
+   **Test this configuration**. Then click **Next**.
+4. Leave **Try dynamic configuration** ticked to get an address
+   automatically (DHCP), or untick it and enter the IP address, subnet
+   mask, gateway and DNS server yourself. Click **Next**.
+5. Follow the remaining pages to name and save the connection.
 
 Unit 0 is the first 82574L card; the driver supports up to four cards
 (units 0 to 3).
