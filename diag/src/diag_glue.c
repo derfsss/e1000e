@@ -22,7 +22,7 @@ struct PCIIFace  *IPCI  = NULL;
 #define GIT_HASH "unknown"
 #endif
 /* The version and the commit it was built from (Staging rule 2). */
-const char build_banner[] = "$VER: e1000e_diag 0.1 (08.11.2026) build " GIT_HASH;
+const char build_banner[] = "$VER: e1000e_diag 0.2 (10.11.2026) build " GIT_HASH;
 
 extern int32 rust_main(STRPTR args, int32 arglen);
 

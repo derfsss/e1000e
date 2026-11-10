@@ -21,6 +21,10 @@
 //! - Statistics (global, extended, special, per tracked type), events,
 //!   throughput sampling, multicast with reference counts, promiscuous and
 //!   exclusive opens.
+//! - The unofficial SANA-II extensions (sana2ext, the amigaos4 crate's
+//!   docs/devices/sana2ext.md): S2X_QUERY with its capability list, read
+//!   and write batches (S2X_READBATCH, S2X_WRITEBATCH), receive checksum
+//!   results.
 //!
 //! DMA works on machines whose caches do not snoop PCI: each pool is
 //! mapped once (StartDMA) for its physical address, and every buffer and
@@ -74,6 +78,7 @@ use amigaos4::device::{answer_device_query, Abort, IoReq, RequestQueue, Worker};
 use amigaos4::interrupt::{IntServer, ResetCallback};
 use amigaos4::mem::{DmaBuffer, DmaDirection, DmaMapping};
 use amigaos4::sana2::*;
+use amigaos4::sana2ext as x;
 use amigaos4::serial_println;
 use amigaos4::sys::{self, IORequest, PCIDevice, TagItem, Task};
 use amigaos4::timer::{AmigaTimer, TimerUnit, TimerVal};
@@ -104,15 +109,75 @@ const MAX_UNITS: usize = 4;
 
 /// One receive or transmit buffer for normal frames (RCTL.BSIZE 2048).
 const BUF_SIZE: usize = 2048;
-/// One buffer when jumbo frames are on (diag build): 16384 bytes, one
-/// frame per descriptor (as FreeBSD's em driver does).
-#[cfg(feature = "diag")]
+/// One buffer when jumbo frames are on (an MTU above 1500: S2XSET_MTU, or
+/// the diag build's ENV:e1000e_diag/MTU): 16384 bytes, one frame per
+/// descriptor (as FreeBSD's em driver does).
 const JUMBO_BUF_SIZE: usize = 16384;
-/// The largest MTU the 82574 takes (maximum frame 9018 + VLAN).
-#[cfg(feature = "diag")]
+/// The MTUs the driver allows (the 82574 takes frames up to 9018 bytes;
+/// the smallest is IPv4's minimum).
 const JUMBO_MTU_MAX: u32 = 9000;
-/// Receive descriptors and buffers (a multiple of RX_GROUP).
-const RX_BUFFERS: usize = 128;
+const MTU_MIN: u32 = 68;
+/// Receive descriptors and buffers for normal frames (a multiple of
+/// RX_GROUP; 1 MB of buffers). 128 overran with igb.device on real
+/// hardware at ~37,000 frames a second (two downloads at once): the card's
+/// receive FIFO overflowed while the ring waited to be emptied. The
+/// descriptor ring is
+/// always this long (also with jumbo frames, which use its first
+/// RX_BUFFERS_JUMBO), so it never moves while the unit runs: the write
+/// path's peek reads it without a lock.
+const RX_BUFFERS: usize = 512;
+/// With jumbo frames (16 KB buffers): 2 MB.
+const RX_BUFFERS_JUMBO: usize = 128;
+
+/// TCP segmentation (S2XCAP_SEGMENT): a segmented send is copied into one
+/// of TSO_BUFS buffers of TSO_BUF bytes (a pool of its own, mapped once,
+/// like the others), not into the ring's slots, and goes to the card with
+/// one data descriptor (DTALEN is 16 bits). TSO_MAX_DATA is the most
+/// ios2_DataLength (s2xcs_MaxSize), so the whole frame with its Ethernet
+/// header fits a buffer and a descriptor.
+const TSO_BUFS: usize = 8;
+const TSO_BUF: usize = 65536;
+const TSO_MAX_DATA: u32 = 65000;
+/// MSS limits: at most 9216 bytes (each segment must fit the MTU anyway); the smallest
+/// taken here, and the most segments one send may make.
+const TSO_MSS_MAX: u32 = 9216;
+const TSO_MSS_MIN: u16 = 64;
+const TSO_MAX_SEGMENTS: u16 = 1024;
+
+/// Flow control until S2XSET_FLOWCONTROL says otherwise: both ways, as
+/// auto-negotiation resolves it with the link partner.
+const FC_DEFAULT: u32 = x::S2XFC_AUTO | x::S2XFC_RX | x::S2XFC_TX;
+/// The longest interrupt interval S2XSET_MODERATION takes (EITR's 13-bit
+/// interval in 0.25 us units, a whole microsecond each step here).
+/// ITR is 16 bits of 256 ns: at most 16,776 us.
+const MODERATION_MAX_US: u32 = 0xFFFF * 32 / 125;
+
+/// The pause bits the PHY advertises for a flow-control setting (IEEE
+/// 802.3 annex 28B): both ways = PAUSE + ASM_DIR, obey only = PAUSE +
+/// ASM_DIR (the partner then resolves to us obeying), send only =
+/// ASM_DIR, none = neither.
+fn fc_adv(modes: u32) -> u16 {
+    match (modes & x::S2XFC_RX != 0, modes & x::S2XFC_TX != 0) {
+        (true, _) => hw::phy::AR_PAUSE | hw::phy::AR_ASM_DIR,
+        (false, true) => hw::phy::AR_ASM_DIR,
+        (false, false) => 0,
+    }
+}
+
+/// Buffer size, RCTL long-packet bit and receive buffers for an MTU.
+/// The packet buffer split for a maximum frame (FreeBSD em: 22 KB for
+/// receive above 8 KB frames, else 32 KB).
+fn pba_for(max_frame: u32) -> u32 {
+    if max_frame > 8192 { bit::PBA_22K } else { bit::PBA_32K }
+}
+
+fn sizes_for(mtu: u32) -> (usize, u32, usize) {
+    if mtu as usize > eth::MTU {
+        (JUMBO_BUF_SIZE, bit::RCTL_SZ_16384 | bit::RCTL_BSEX | bit::RCTL_LPE, RX_BUFFERS_JUMBO)
+    } else {
+        (BUF_SIZE, 0, RX_BUFFERS)
+    }
+}
 /// Receive descriptors go back to the card eight at a time: 128 bytes, a
 /// whole number of cache lines on every PowerPC the driver runs on.
 const RX_GROUP: usize = 8;
@@ -126,6 +191,16 @@ const MCAST_TABLE_MAX: usize = 64;
 const MCAST_RANGE_MAX: u64 = 64;
 const STORM_LIMIT: u32 = 1000;
 const MAX_RECOVERIES: u32 = 8;
+
+/// SANA-II extensions (docs/devices/sana2ext.md in the amigaos4 crate):
+/// the most frames one S2X_READBATCH / S2X_WRITEBATCH may carry
+/// (S2XCapBatch's s2xcb_MaxFrames), and the driver's own revision of
+/// them (s2xq_Revision).
+const BATCH_MAX: u32 = 64;
+const S2X_REVISION: u16 = 1;
+/// Transmit queues: one (S2XCapRSS s2xcr_MaxTxQueues 1); receive queues
+/// follow RSS (Unit::rx_queues).
+const TX_QUEUES: u32 = 1;
 
 /// Test only: reset the card behind the driver's back (recovery test).
 #[cfg(feature = "diag")]
@@ -283,9 +358,503 @@ struct Stats {
     recoveries: u64,
 }
 
+/// A posted receive request: a CMD_READ, or an S2X_READBATCH with how far
+/// it is filled. CMD_READs and read batches share one list in posting
+/// order: a frame goes to the oldest one of its type (per opener).
+#[derive(Clone, Copy)]
+struct Rd {
+    r: S2Req,
+    /// Posting order (Shared::seq when it was posted).
+    seq: u32,
+    /// The request's packet type and opener, kept here when it is posted:
+    /// choosing a read for a frame then reads only this list, not every
+    /// posted request.
+    ptype: u32,
+    op: *mut Opener,
+    batch: Option<RxBatch>,
+}
+
+#[derive(Clone, Copy)]
+struct RxBatch {
+    /// The next frame to fill: a node of s2xb_Frames.
+    next: *mut MinNode,
+    filled: u32,
+    /// Frames it can take (s2xb_Count, at most the list's length).
+    max: u32,
+    queue: u32,
+}
+
+impl Rd {
+    /// Reply it: a batch with s2xb_Done set to the frames filled.
+    ///
+    /// # Safety
+    /// A request the driver holds (taken out of the list).
+    unsafe fn end(self, error: i8, wire: u32) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if let Some(b) = self.batch {
+                set_done(self.r, b.filled);
+            }
+            self.r.reply(error, wire);
+        }
+    }
+}
+
+/// Where a received frame goes: a posted CMD_READ or read batch (taken out
+/// of the list), or an S2_READORPHAN.
+#[derive(Clone, Copy)]
+enum Pick {
+    Read(Rd),
+    Orphan(S2Req),
+}
+
+/// Openers one frame is handed to without a heap allocation (more spill
+/// into a Vec).
+const TAKEN_INLINE: usize = 4;
+
+/// The reads a received frame goes to, one per opener. Inline for the
+/// usual few openers: a heap allocation and free per frame (AllocVecTags,
+/// FreeVec) cost more than the rest of choosing the reads.
+struct Taken {
+    n: usize,
+    inline: [Option<(Pick, *mut Opener)>; TAKEN_INLINE],
+    more: Vec<(Pick, *mut Opener)>,
+}
+
+impl Taken {
+    const fn new() -> Self {
+        Taken { n: 0, inline: [None; TAKEN_INLINE], more: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        self.n
+    }
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn push(&mut self, v: (Pick, *mut Opener)) {
+        if self.n < TAKEN_INLINE {
+            self.inline[self.n] = Some(v);
+        } else {
+            self.more.push(v);
+        }
+        self.n += 1;
+    }
+
+    fn has(&self, op: *mut Opener) -> bool {
+        self.iter().any(|(_, o)| o == op)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (Pick, *mut Opener)> + '_ {
+        self.inline.iter().flatten().copied().chain(self.more.iter().copied())
+    }
+}
+
+/// The card's receive checksum result for a frame as S2XCS_... flags:
+/// IP_GOOD/BAD when it checked the IPv4 header (IPCS), L4_GOOD/BAD when
+/// it checked TCP or UDP (L4I). Never an L4 result for an IP fragment
+/// (IPv4 MF or offset, an IPv6 fragment header first): the card does not
+/// check those, and a result there would mean only part of a datagram.
+/// 0: nothing checked (ARP, ICMP, other types).
+fn rx_checksum(frame: &[u8], status: u8, errors: u8) -> u32 {
+    let mut cs = 0;
+    if status & bit::RXD_STAT_IPCS != 0 {
+        cs |= if errors & bit::RXD_ERR_IPE != 0 { x::S2XCS_IP_BAD } else { x::S2XCS_IP_GOOD };
+    }
+    let v4 = frame.len() > 13 && frame[12] == 0x08 && frame[13] == 0x00;
+    if v4 && status & bit::RXD_STAT_L4I != 0 && !ip_fragment(frame) {
+        cs |= if errors & bit::RXD_ERR_L4E != 0 { x::S2XCS_L4_BAD } else { x::S2XCS_L4_GOOD };
+    }
+    cs
+}
+
+/// Whether an Ethernet frame holds an IP fragment.
+fn ip_fragment(f: &[u8]) -> bool {
+    if f.len() < eth::HLEN + 20 {
+        return false;
+    }
+    match (f[12], f[13]) {
+        // IPv4: more fragments, or a fragment offset.
+        (0x08, 0x00) => (u16::from_be_bytes([f[20], f[21]]) & 0x3FFF) != 0,
+        // IPv6: a fragment header straight after the fixed header.
+        (0x86, 0xDD) => f.len() >= eth::HLEN + 40 && f[20] == 44,
+        _ => false,
+    }
+}
+
+/// A write frame's checksum request (its S2XFRAME_CHECKSUM item): the
+/// FILL_ flags, and for FILL_L4 where the sum starts (s2xfc_Start) and
+/// where the result goes (s2xfc_Offset, from Start), counted from the
+/// first byte of the data the buffer management copies (the IP header,
+/// or the Ethernet header with SANA2IOF_RAW).
+#[derive(Clone, Copy)]
+struct TxCsum {
+    flags: u32,
+    start: u16,
+    offset: u16,
+}
+
+/// The checksum request of write batch frame `f`, if it asks for one.
+///
+/// # Safety
+/// `f` is a validated frame (`check_batch`).
+unsafe fn tx_csum_item(f: *mut MinNode) -> Option<TxCsum> {
+    // SAFETY: the caller's contract; the items are the stack's, read only.
+    unsafe {
+        let items = core::ptr::addr_of!((*(f as *mut x::S2XFrame)).s2xf_Items);
+        let c = x::find::<x::S2XFrameChecksum>(items, x::S2XFRAME_CHECKSUM)?;
+        let flags = core::ptr::addr_of!((*c).s2xfc_Flags).read_unaligned();
+        if flags & (x::S2XCS_FILL_IP | x::S2XCS_FILL_L4) == 0 {
+            return None;
+        }
+        Some(TxCsum {
+            flags,
+            start: core::ptr::addr_of!((*c).s2xfc_Start).read_unaligned(),
+            offset: core::ptr::addr_of!((*c).s2xfc_Offset).read_unaligned(),
+        })
+    }
+}
+
+/// A write frame's segmentation request (its S2XFRAME_SEGMENT item).
+#[derive(Clone, Copy)]
+struct TxSeg {
+    proto: u32,
+    seg: u16,
+    hdrlen: u16,
+}
+
+/// The segmentation request of write batch frame `f`, if any.
+///
+/// # Safety
+/// `f` is a validated frame (`check_batch`).
+unsafe fn tx_seg_item(f: *mut MinNode) -> Option<TxSeg> {
+    // SAFETY: the caller's contract; the items are the stack's, read only.
+    unsafe {
+        let items = core::ptr::addr_of!((*(f as *mut x::S2XFrame)).s2xf_Items);
+        let s = x::find::<x::S2XFrameSegment>(items, x::S2XFRAME_SEGMENT)?;
+        Some(TxSeg {
+            proto: core::ptr::addr_of!((*s).s2xfs_Protocol).read_unaligned(),
+            seg: core::ptr::addr_of!((*s).s2xfs_SegSize).read_unaligned(),
+            hdrlen: core::ptr::addr_of!((*s).s2xfs_HdrLen).read_unaligned(),
+        })
+    }
+}
+
+/// Plan TCP segmentation of `fr` (the whole frame, Ethernet header first)
+/// for the card: the context's IPLEN, TCP header length (L4LEN) and MSS,
+/// the data descriptor's TSE with TXSM (and IXSM for IPv4: the card
+/// rewrites every segment's IP header) and PAYLEN, the payload after all
+/// the headers. The stack's pseudo-header sum (length 0) is in the TCP
+/// checksum field; the card adds each segment's length and fixes lengths,
+/// sequence numbers, IP ids and checksums (the 82574's TCP segmentation).
+/// None: the request does not describe this frame (protocol, header
+/// length, checksum offsets) or is outside the limits (MSS 64..9216, each
+/// segment within the MTU, headers within 512 bytes, at most
+/// TSO_MAX_SEGMENTS segments, some payload).
+fn tso_plan(fr: &[u8], raw: bool, s: TxSeg, c: TxCsum, mtu: u32) -> Option<Offload> {
+    let len = fr.len();
+    let maclen = eth::HLEN;
+    let ver = *fr.get(maclen)? >> 4;
+    let v4 = match (s.proto, ver) {
+        (x::S2XCSUM_TCPV4, 4) => true,
+        _ => return None,
+    };
+    let base = if raw { 0 } else { maclen };
+    let tcp = base + c.start as usize;
+    if c.offset != 16 || tcp < maclen + 20 || tcp + 20 > len {
+        return None;
+    }
+    let iplen = tcp - maclen;
+    if v4 && ((fr[maclen] & 15) as usize) * 4 != iplen {
+        return None;
+    }
+    let l4len = ((fr[tcp + 12] >> 4) as usize) * 4;
+    let hdrs = tcp + l4len;
+    if l4len < 20 || hdrs > len || hdrs > 512 || base + s.hdrlen as usize != hdrs {
+        return None;
+    }
+    let mss = s.seg as u32;
+    let paylen = (len - hdrs) as u32;
+    if mss < TSO_MSS_MIN as u32 || mss > TSO_MSS_MAX || (iplen + l4len) as u32 + mss > mtu || paylen == 0 || paylen.div_ceil(mss) > TSO_MAX_SEGMENTS as u32 {
+        return None;
+    }
+    let mut p = Offload {
+        iplen: iplen as u32,
+        tucmd: hw::bit::TXCTX_TUCMD_TCP,
+        popts: hw::bit::TXD_POPTS_TXSM,
+        mss,
+        l4len: l4len as u32,
+        paylen,
+    };
+    if v4 {
+        p.tucmd |= hw::bit::TXCTX_TUCMD_IP;
+        p.popts |= hw::bit::TXD_POPTS_IXSM;
+    }
+    Some(p)
+}
+
+/// What the card is to do for a frame's checksums: the context
+/// descriptor's IP header length and TUCMD, the data descriptor's POPTS.
+#[derive(Clone, Copy)]
+struct Offload {
+    iplen: u32,
+    tucmd: u32,
+    popts: u32,
+    /// Segmentation (0: none): the MSS, the TCP header length and the
+    /// payload length (PAYLEN).
+    mss: u32,
+    l4len: u32,
+    paylen: u32,
+}
+
+/// Plan the checksums `c` asks for on `fr` (the whole frame, Ethernet
+/// header first; `raw`: the stack's offsets count from it, else from the
+/// IP header after it). The card inserts an IPv4 header checksum
+/// (IXSM: from MACLEN, IPLEN long, at MACLEN + 10) and a TCP or UDP
+/// checksum (TXSM: from MACLEN + IPLEN to the end of the data, at +16 or
+/// +6), the stack having put the pseudo-header sum there (the 82574's
+/// TCP/IP context descriptor; the same model as the request's). Anything the card
+/// cannot express this way (another offset, a sum that does not start
+/// right after a 20..511-byte IP header) is computed here, in place, so
+/// the request's meaning holds whatever it says. None: the request does
+/// not fit the frame (refused).
+fn tx_offload(fr: &mut [u8], raw: bool, c: TxCsum) -> Option<Offload> {
+    let len = fr.len();
+    let maclen = eth::HLEN;
+    let v4 = fr.get(maclen).map_or(false, |b| b >> 4 == 4);
+    let mut p = Offload { iplen: 0, tucmd: if v4 { hw::bit::TXCTX_TUCMD_IP } else { 0 }, popts: 0, mss: 0, l4len: 0, paylen: 0 };
+    if c.flags & x::S2XCS_FILL_IP != 0 {
+        if !v4 {
+            return None;
+        }
+        let ihl = ((fr[maclen] & 15) as usize) * 4;
+        if ihl < 20 || maclen + ihl > len {
+            return None;
+        }
+        p.iplen = ihl as u32;
+        p.popts |= hw::bit::TXD_POPTS_IXSM;
+    }
+    if c.flags & x::S2XCS_FILL_L4 != 0 {
+        let base = if raw { 0 } else { maclen };
+        let start = base + c.start as usize;
+        let at = start + c.offset as usize;
+        if start > len || at + 2 > len {
+            return None;
+        }
+        let iplen = start.wrapping_sub(maclen);
+        let card = start >= maclen + 20
+            && iplen <= 511
+            && (c.offset == 6 || c.offset == 16)
+            && (p.iplen == 0 || p.iplen as usize == iplen);
+        if card {
+            p.iplen = iplen as u32;
+            p.popts |= hw::bit::TXD_POPTS_TXSM;
+            if c.offset == 16 {
+                p.tucmd |= hw::bit::TXCTX_TUCMD_TCP;
+            }
+        } else {
+            // The one's complement sum from Start to the end of the frame
+            // (the pseudo-header sum is already in the field), complemented.
+            let mut s = 0u32;
+            for ch in fr[start..].chunks(2) {
+                s += (ch[0] as u32) << 8 | *ch.get(1).unwrap_or(&0) as u32;
+            }
+            while s >> 16 != 0 {
+                s = (s & 0xFFFF) + (s >> 16);
+            }
+            fr[at..at + 2].copy_from_slice(&(!(s as u16)).to_be_bytes());
+        }
+    }
+    Some(p)
+}
+
+/// Put `rd` back in posting order (after a frame went to it, or the stack's
+/// filter refused one).
+fn reinsert(s: &mut Shared, rd: Rd) {
+    let pos = s.reads.iter().position(|x| (x.seq.wrapping_sub(rd.seq) as i32) > 0).unwrap_or(s.reads.len());
+    s.reads.insert(pos, rd);
+}
+
+/// s2xb_Done of a batch request.
+///
+/// # Safety
+/// `r` is a validated batch request (ios2_StatData an S2XBatch).
+unsafe fn set_done(r: S2Req, n: u32) {
+    let b = r.stat_data() as *mut x::S2XBatch;
+    // SAFETY: the caller's contract.
+    unsafe { core::ptr::addr_of_mut!((*b).s2xb_Done).write_unaligned(n) };
+}
+
+/// The standard request of a batch frame.
+///
+/// # Safety
+/// `f` is a validated frame (`check_batch`).
+unsafe fn frame_req(f: *mut MinNode) -> S2Req {
+    // SAFETY: the caller's contract (s2xf_Req checked non-null).
+    unsafe { S2Req::from_raw(core::ptr::addr_of!((*(f as *mut x::S2XFrame)).s2xf_Req).read_unaligned() as *mut IORequest).unwrap() }
+}
+
+/// The frame after `f` in its batch.
+///
+/// # Safety
+/// `f` is a node of a well-formed list.
+unsafe fn next_frame(f: *mut MinNode) -> *mut MinNode {
+    // SAFETY: the caller's contract.
+    unsafe { core::ptr::addr_of!((*f).mln_Succ).read_unaligned() }
+}
+
+/// Check an S2X_READBATCH / S2X_WRITEBATCH before it is taken: its
+/// structure, the frame count (1..=BATCH_MAX), every frame (sized, with a
+/// request) and the queue. Returns the first frame, the frames it carries
+/// (s2xb_Count, or fewer if the list is shorter) and the queue, with
+/// s2xb_Done set to 0.
+///
+/// # Safety
+/// `r` is an opened request.
+unsafe fn check_batch(r: S2Req, queues: u32) -> Result<(*mut MinNode, u32, u32), (i8, u32)> {
+    let b = r.stat_data() as *mut x::S2XBatch;
+    if b.is_null() {
+        return Err((S2ERR_BAD_ARGUMENT, S2WERR_NULL_POINTER));
+    }
+    // SAFETY: the stack's batch; s2xb_Size is read first and the rest only
+    // when it covers the whole structure.
+    unsafe {
+        let size = core::ptr::addr_of!((*b).s2xb_Size).read_unaligned() as usize;
+        if size < core::mem::size_of::<x::S2XBatch>() {
+            return Err((IOERR_BADLENGTH, S2WERR_BAD_STATDATA));
+        }
+        let count = core::ptr::addr_of!((*b).s2xb_Count).read_unaligned();
+        let queue = core::ptr::addr_of!((*b).s2xb_Queue).read_unaligned();
+        if count == 0 || count > BATCH_MAX || queue >= queues {
+            return Err((S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR));
+        }
+        let list = core::ptr::addr_of_mut!((*b).s2xb_Frames);
+        let mut first = null_mut();
+        let mut n = 0u32;
+        for f in x::nodes(list) {
+            if n == count {
+                break;
+            }
+            let fr = f as *mut x::S2XFrame;
+            let fsize = core::ptr::addr_of!((*fr).s2xf_Size).read_unaligned() as usize;
+            if fsize < core::mem::size_of::<x::S2XFrame>() {
+                return Err((S2ERR_BAD_ARGUMENT, S2WERR_BAD_STATDATA));
+            }
+            if core::ptr::addr_of!((*fr).s2xf_Req).read_unaligned().is_null() {
+                return Err((S2ERR_BAD_ARGUMENT, S2WERR_NULL_POINTER));
+            }
+            if n == 0 {
+                first = f;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            return Err((S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR));
+        }
+        core::ptr::addr_of_mut!((*b).s2xb_Done).write_unaligned(0);
+        Ok((first, n, queue))
+    }
+}
+
+/// The capability items S2X_QUERY hands out: built when the unit starts,
+/// freed when it stops (after the last CloseDevice), never changed in
+/// between, so any opener's task may read them.
+#[repr(C)]
+struct Caps {
+    list: x::MinList,
+    batch: x::S2XCapBatch,
+    rx_csum: x::S2XCapChecksum,
+    tx_csum: x::S2XCapChecksum,
+    mtu: x::S2XCapMTU,
+    moderation: x::S2XCapModeration,
+    flow: x::S2XCapFlowControl,
+    segment: x::S2XCapSegment,
+    /// s2xq_Features: one bit per item in the list.
+    features: u32,
+}
+
+impl Caps {
+    /// `tso`: the unit has its segmentation buffers (S2XCAP_SEGMENT).
+    fn build(tso: bool) -> Box<Caps> {
+        let mut c = Box::new(Caps {
+            list: x::MinList { mlh_Head: null_mut(), mlh_Tail: null_mut(), mlh_TailPred: null_mut() },
+            batch: x::S2XCapBatch {
+                s2xcb_Header: x::S2XItem::new(x::S2XCAP_BATCH, core::mem::size_of::<x::S2XCapBatch>()),
+                s2xcb_MaxFrames: BATCH_MAX,
+                s2xcb_Flags: 0,
+            },
+            // What the 82574 checks on receive and the driver reports
+            // (legacy descriptors: IPv4 only).
+            rx_csum: x::S2XCapChecksum {
+                s2xcc_Header: x::S2XItem::new(x::S2XCAP_RXCHECKSUM, core::mem::size_of::<x::S2XCapChecksum>()),
+                s2xcc_Protocols: x::S2XCSUM_IPV4 | x::S2XCSUM_TCPV4 | x::S2XCSUM_UDPV4,
+                s2xcc_Reserved: 0,
+            },
+            // What the card computes on send (context descriptors), with
+            // the driver computing what the card cannot express.
+            tx_csum: x::S2XCapChecksum {
+                s2xcc_Header: x::S2XItem::new(x::S2XCAP_TXCHECKSUM, core::mem::size_of::<x::S2XCapChecksum>()),
+                s2xcc_Protocols: x::S2XCSUM_IPV4 | x::S2XCSUM_TCPV4 | x::S2XCSUM_UDPV4 | x::S2XCSUM_TCPV6 | x::S2XCSUM_UDPV6,
+                s2xcc_Reserved: 0,
+            },
+            mtu: x::S2XCapMTU {
+                s2xcm_Header: x::S2XItem::new(x::S2XCAP_MTU, core::mem::size_of::<x::S2XCapMTU>()),
+                s2xcm_MinMTU: MTU_MIN,
+                s2xcm_MaxMTU: JUMBO_MTU_MAX,
+            },
+            // One interval for receive and transmit (one interrupt): no
+            // S2XMOD_TX.
+            moderation: x::S2XCapModeration {
+                s2xco_Header: x::S2XItem::new(x::S2XCAP_MODERATION, core::mem::size_of::<x::S2XCapModeration>()),
+                s2xco_MaxMicros: MODERATION_MAX_US,
+                s2xco_Flags: x::S2XMOD_RX,
+            },
+            flow: x::S2XCapFlowControl {
+                s2xcf_Header: x::S2XItem::new(x::S2XCAP_FLOWCONTROL, core::mem::size_of::<x::S2XCapFlowControl>()),
+                s2xcf_Modes: x::S2XFC_RX | x::S2XFC_TX | x::S2XFC_AUTO,
+                s2xcf_Reserved: 0,
+            },
+            segment: x::S2XCapSegment {
+                s2xcs_Header: x::S2XItem::new(x::S2XCAP_SEGMENT, core::mem::size_of::<x::S2XCapSegment>()),
+                s2xcs_Protocols: x::S2XCSUM_TCPV4,
+                s2xcs_MaxSize: TSO_MAX_DATA,
+                s2xcs_MaxSegments: TSO_MAX_SEGMENTS,
+                s2xcs_MinSegSize: TSO_MSS_MIN,
+                s2xcs_Reserved: 0,
+            },
+            features: 0,
+        });
+        let l = core::ptr::addr_of_mut!((*c).list);
+        // SAFETY: the list and its items live in one box that does not
+        // move while linked.
+        unsafe {
+            x::MinList::init(l);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).batch) as *mut MinNode);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).rx_csum) as *mut MinNode);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).tx_csum) as *mut MinNode);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).mtu) as *mut MinNode);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).moderation) as *mut MinNode);
+            x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).flow) as *mut MinNode);
+            if tso {
+                x::MinList::add_tail(l, core::ptr::addr_of_mut!((*c).segment) as *mut MinNode);
+            }
+        }
+        c.features = x::S2XF_BATCH | x::S2XF_RXCHECKSUM | x::S2XF_TXCHECKSUM | x::S2XF_MTU | x::S2XF_MODERATION | x::S2XF_FLOWCONTROL;
+        if tso {
+            c.features |= x::S2XF_SEGMENT;
+        }
+        c
+    }
+}
+
 struct Shared {
     openers: Vec<*mut Opener>,
-    reads: Vec<S2Req>,
+    /// Oldest first; a frame usually takes the front one.
+    reads: VecDeque<Rd>,
+    /// The next Rd::seq.
+    seq: u32,
     orphans: Vec<S2Req>,
     events: Vec<S2Req>,
     samples: Vec<S2Req>,
@@ -320,7 +889,8 @@ impl Shared {
     const fn new() -> Self {
         Shared {
             openers: Vec::new(),
-            reads: Vec::new(),
+            reads: VecDeque::new(),
+            seq: 0,
             orphans: Vec::new(),
             events: Vec::new(),
             samples: Vec::new(),
@@ -417,6 +987,11 @@ struct Unit {
     /// else on the card): the unit task for each pass of its loop, or a
     /// writer that got it with MutexAttempt (TUNE_RX_IN_WRITER).
     rxl: Locked<()>,
+    /// S2X_QUERY's capability items while the unit runs (null otherwise).
+    caps: AtomicPtr<Caps>,
+    /// Receive queues in force (always 1: no RSS on this driver): read
+    /// batches name one.
+    rx_queues: AtomicU32,
     /// The card went idle (TXQE seen) since the last tail write.
     tx_idle: AtomicU32,
     /// Frames longer than a normal Ethernet frame (jumbo), each way.
@@ -474,7 +1049,9 @@ mod perf {
     pub const PRI_CHANGES: usize = 15;
     /// Tail writes put off by transmit batching.
     pub const TX_DEFERRED: usize = 16;
-    pub const N: usize = 17;
+    /// Frames sent with a checksum offload (sana2ext S2XFRAME_CHECKSUM).
+    pub const TX_OFFLOADS: usize = 17;
+    pub const N: usize = 18;
 }
 
 /// Timebase ticks per microsecond, set when the first unit starts.
@@ -540,6 +1117,8 @@ impl Unit {
         rx_holding: AtomicU32::new(0),
         tune: AtomicU32::new(TUNE_DEFAULT),
         rxl: Locked::new(()),
+        caps: AtomicPtr::new(null_mut()),
+        rx_queues: AtomicU32::new(1),
         tx_idle: AtomicU32::new(1),
         jumbo_rx: AtomicU32::new(0),
         jumbo_tx: AtomicU32::new(0),
@@ -601,10 +1180,9 @@ const TASK_NAMES: [&[u8]; MAX_UNITS] = [
 // The card (owned by the unit task)
 // ---------------------------------------------------------------------------
 
-struct Net {
-    dev: *mut PCIDevice,
-    r: Regs,
-    u: &'static Unit,
+/// One receive queue: its descriptor ring (always RX_BUFFERS long), its
+/// buffers (rx_n of buf_size), where the driver is in it.
+struct RxQ {
     // Mappings before their buffers: they drop (EndDMA) first. Each is
     // made once, for the physical address; the cache is managed per
     // transfer (see the module notes).
@@ -614,15 +1192,39 @@ struct Net {
     bufs: DmaBuffer,
     ring_phys: u32,
     pool_phys: u32,
-    rx_n: usize,
     /// The next descriptor to look at.
     next: usize,
     /// RDT: the first descriptor of the group the driver holds back.
     tail: usize,
     /// The frame at `next` waits for a read, since then (timebase). While
-    /// it waits nothing behind it is taken: the ring fills and the card
-    /// holds back, instead of frames being dropped.
+    /// it waits nothing behind it on this queue is taken: the ring fills
+    /// and the card holds back, instead of frames being dropped.
     held: Option<u64>,
+}
+
+impl RxQ {
+    /// A queue's ring and `rx_n` buffers of `buf_size`, mapped for DMA
+    /// (before the CPU writes them: StartDMA may invalidate the cache), the
+    /// buffers out of the cache.
+    unsafe fn alloc(rx_n: usize, buf_size: usize) -> Result<RxQ, String> {
+        let e = |x: amigaos4::AmigaError| alloc::format!("{}", x);
+        let mut ring = DmaBuffer::alloc_contiguous(RX_BUFFERS * hw::DESC_SIZE, 4096).map_err(e)?;
+        let mut bufs = DmaBuffer::alloc_contiguous(rx_n * buf_size, 4096).map_err(e)?;
+        // SAFETY: fresh pools of these sizes.
+        let (ring_map, ring_phys) = unsafe { map_pool(&mut ring, RX_BUFFERS * hw::DESC_SIZE, DmaDirection::FromDevice)? };
+        let (pool_map, pool_phys) = unsafe { map_pool(&mut bufs, rx_n * buf_size, DmaDirection::FromDevice)? };
+        arch::cache_invalidate(bufs.as_mut_ptr(), rx_n * buf_size);
+        Ok(RxQ { _ring_map: Some(ring_map), _pool_map: Some(pool_map), ring, bufs, ring_phys, pool_phys, next: 0, tail: 0, held: None })
+    }
+}
+
+struct Net {
+    dev: *mut PCIDevice,
+    r: Regs,
+    u: &'static Unit,
+    /// The receive queues: queue 0 always, more with RSS.
+    q: Vec<RxQ>,
+    rx_n: usize,
     /// HOLD_MS in timebase ticks.
     hold_limit: u64,
     /// What the card was last told.
@@ -636,10 +1238,71 @@ struct Net {
     pba: u32,
     /// The largest frame (MTU + header + CRC), for the flow-control marks.
     max_frame: u32,
+    /// Read batches that took a frame in this receive pass: replied at
+    /// its end (a batch takes every frame waiting, at least one).
+    touched: Vec<S2Req>,
+    /// Flow control as set (S2XFC_...): with AUTO resolved at each link
+    /// up, else forced.
+    fc_modes: u32,
+    /// The interrupt interval (EITR 0 bits 14:2, 0.25 us units) as set:
+    /// kept over resets.
+    itr: u32,
 }
 
-/// Find every 82574 card, locked for this driver, in unit order.
-unsafe fn find_cards() -> Vec<*mut PCIDevice> {
+/// The namespace of the card claims (exec named memory).
+const CLAIM_SPACE: &[u8] = b"e1000e\0";
+
+/// A card claimed by this driver: a named memory block "card at 0x..."
+/// (the card's register address) in the "e1000e" namespace. PCIDevice
+/// Lock(EXCLUSIVE) alone did not keep the other build out (both are
+/// initialised by ramlib's task, and the second took a card the first was
+/// running). AllocNamedMemory fails when the name exists, so claiming is
+/// one step. (An exec resource made of a bare Node did not work: the
+/// second build's OpenResource on it never returned.)
+struct CardClaim {
+    name: [u8; 32],
+}
+
+static CLAIMS: [AtomicPtr<CardClaim>; MAX_UNITS] = [const { AtomicPtr::new(null_mut()) }; MAX_UNITS];
+
+/// The claim's name for a card (NUL-terminated), from its register address.
+unsafe fn claim_name(dev: *mut PCIDevice) -> Option<[u8; 32]> {
+    let (base, _) = bar0(dev)?;
+    let mut name = [0u8; 32];
+    let text = alloc::format!("card at 0x{:08x}", base);
+    name[..text.len()].copy_from_slice(text.as_bytes());
+    Some(name)
+}
+
+/// Whether another e1000e build has claimed this card.
+unsafe fn card_claimed(dev: *mut PCIDevice) -> bool {
+    match claim_name(dev) {
+        Some(name) => !sys::exec_find_named_memory(CLAIM_SPACE.as_ptr() as _, name.as_ptr() as _).is_null(),
+        None => false,
+    }
+}
+
+/// Claim a card for this driver. None: it has no register range, or
+/// another e1000e build claimed it first.
+unsafe fn claim_card(dev: *mut PCIDevice) -> Option<*mut CardClaim> {
+    let name = claim_name(dev)?;
+    let mut tags = [TagItem { ti_Tag: sys::TAG_DONE, ti_Data: 0 }];
+    let m = sys::exec_alloc_named_memory(4, CLAIM_SPACE.as_ptr() as _, name.as_ptr() as _, tags.as_mut_ptr());
+    if m.is_null() {
+        return None;
+    }
+    Some(Box::into_raw(Box::new(CardClaim { name })))
+}
+
+unsafe fn release_claim(c: *mut CardClaim) {
+    if !c.is_null() {
+        sys::exec_free_named_memory(CLAIM_SPACE.as_ptr() as _, (*c).name.as_ptr() as _);
+        drop(Box::from_raw(c));
+    }
+}
+
+/// Find every 82574 card, locked and claimed for this driver, in unit order.
+unsafe fn find_cards() -> Vec<(*mut PCIDevice, *mut CardClaim)> {
     let mut found = Vec::new();
     for id in hw::DEVICE_IDS {
         for index in 0.. {
@@ -656,12 +1319,25 @@ unsafe fn find_cards() -> Vec<*mut PCIDevice> {
             if dev.is_null() {
                 break;
             }
-            if pci!(dev, Lock, sys::PCI_LOCK_EXCLUSIVE) == 0 {
-                serial_println!("{}: 8086:{:04x} #{} is locked by another driver; skipped", NAME, id, index);
-                sys::wrappers::pci::pci_free_device(dev);
+            // Another e1000e build has this card: leave it completely alone.
+            // No Lock, no Unlock and no FreeDevice: the handle FindDevice
+            // gives out is the other driver's own (freeing it on QEMU sent
+            // the running driver's config writes to the virtio-scsi
+            // controller).
+            if card_claimed(dev) {
+                serial_println!("{}: 8086:{:04x} #{} is run by another e1000e build; skipped", NAME, id, index);
                 continue;
             }
-            found.push(dev);
+            if pci!(dev, Lock, sys::PCI_LOCK_EXCLUSIVE) == 0 {
+                serial_println!("{}: 8086:{:04x} #{} is locked by another driver; skipped", NAME, id, index);
+                continue;
+            }
+            let Some(claim) = claim_card(dev) else {
+                serial_println!("{}: 8086:{:04x} #{} has no register range, or another e1000e build claimed it; skipped", NAME, id, index);
+                pci!(dev, Unlock);
+                continue;
+            };
+            found.push((dev, claim));
         }
     }
     found
@@ -739,15 +1415,8 @@ impl Net {
         #[cfg(not(feature = "diag"))]
         let mtu = eth::MTU as u32;
         let max_frame = mtu + eth::HLEN as u32 + 4;
-        #[cfg(feature = "diag")]
-        let (buf_size, rctl_size) = if mtu as usize > eth::MTU {
-            (JUMBO_BUF_SIZE, bit::RCTL_SZ_16384 | bit::RCTL_BSEX | bit::RCTL_LPE)
-        } else {
-            (BUF_SIZE, 0)
-        };
-        #[cfg(not(feature = "diag"))]
-        let (buf_size, rctl_size) = (BUF_SIZE, 0u32);
-        let pba = if max_frame > 8192 { bit::PBA_22K } else { bit::PBA_32K };
+        let (buf_size, rctl_size, rx_n) = sizes_for(mtu);
+        let pba = pba_for(max_frame);
         r.w(reg::PBA, pba);
         let mut sleep = Sleeper::new();
         r.reset(&mut |ms| sleep.ms(ms))?;
@@ -775,7 +1444,7 @@ impl Net {
                 xlog!("unit {}: ITR {} from ENV:e1000e_diag/ITR", n, v & 0xFFFF);
             }
         }
-        let ps = r.phy_setup();
+        let ps = r.phy_setup(fc_adv(FC_DEFAULT));
         let aspm = aspm_off(dev);
         match ps.error {
             Some(why) => serial_println!("{} unit {}: PHY not set up: {}", NAME, n, why),
@@ -788,33 +1457,33 @@ impl Net {
             ),
         }
 
-        // Receive: the descriptor ring and its buffers. Mapped before the
-        // CPU writes them (StartDMA may invalidate the cache).
-        let rx_n = RX_BUFFERS;
-        let mut ring = DmaBuffer::alloc_contiguous(rx_n * hw::DESC_SIZE, 4096).map_err(e)?;
-        let mut bufs = DmaBuffer::alloc_contiguous(rx_n * buf_size, 4096).map_err(e)?;
-        let (ring_map, ring_phys) = map_pool(&mut ring, rx_n * hw::DESC_SIZE, DmaDirection::FromDevice)?;
-        let (pool_map, pool_phys) = map_pool(&mut bufs, rx_n * buf_size, DmaDirection::FromDevice)?;
+        // Receive: queue 0's ring and buffers.
+        let q0 = RxQ::alloc(rx_n, buf_size)?;
         // Transmit.
         let mut tring = DmaBuffer::alloc_contiguous(TX_SLOTS * hw::DESC_SIZE, 4096).map_err(e)?;
         let mut tbufs = DmaBuffer::alloc_contiguous(TX_SLOTS * buf_size, 4096).map_err(e)?;
         let (tring_map, tring_phys) = map_pool(&mut tring, TX_SLOTS * hw::DESC_SIZE, DmaDirection::ToDevice)?;
         let (tpool_map, tpool_phys) = map_pool(&mut tbufs, TX_SLOTS * buf_size, DmaDirection::ToDevice)?;
+        // Segmentation's pool (optional: without it S2XCAP_SEGMENT is not
+        // offered).
+        let tso = DmaBuffer::alloc_contiguous(TSO_BUFS * TSO_BUF, 4096).ok().and_then(|mut b| {
+            let (m, p) = map_pool(&mut b, TSO_BUFS * TSO_BUF, DmaDirection::ToDevice).ok()?;
+            Some((m, b, p))
+        });
+        if tso.is_none() {
+            serial_println!("{} unit {}: no memory for the segmentation buffers: TCP segmentation not offered", NAME, n);
+        }
+        let (tso_map, tso_buf, tso_phys) = match tso {
+            Some((m, b, p)) => (Some(m), Some(b), p),
+            None => (None, None, 0),
+        };
 
         let mut net = Net {
             dev,
             r,
             u,
-            _ring_map: Some(ring_map),
-            _pool_map: Some(pool_map),
-            ring,
-            bufs,
-            ring_phys,
-            pool_phys,
+            q: alloc::vec![q0],
             rx_n,
-            next: 0,
-            tail: 0,
-            held: None,
             hold_limit: timebase_hz() * HOLD_MS / 1000,
             sent_mode: None,
             sent_mta: None,
@@ -823,11 +1492,12 @@ impl Net {
             rctl_size,
             pba,
             max_frame,
+            touched: Vec::new(),
+            fc_modes: FC_DEFAULT,
+            itr: r.itr(),
         };
-        // No buffer line may be dirty in the cache while the card writes it.
-        arch::cache_invalidate(net.bufs.as_mut_ptr(), rx_n * buf_size);
         net.rx_start();
-        u.rx_ring.store(net.ring.as_mut_ptr(), Ordering::Release);
+        u.rx_ring.store(net.q[0].ring.as_mut_ptr(), Ordering::Release);
 
         let mut tx = TxRing {
             _ring_map: Some(tring_map),
@@ -849,6 +1519,10 @@ impl Net {
             buf_size,
             unkicked_n: 0,
             last_big: false,
+            _tso_map: tso_map,
+            tso: tso_buf,
+            tso_phys,
+            tso_slot: [None; TSO_BUFS],
         };
         tx.start();
         u.tx_idle.store(1, Ordering::Release);
@@ -880,36 +1554,54 @@ impl Net {
         Ok(net)
     }
 
-    unsafe fn rx_desc(&mut self, i: usize) -> *mut u8 {
-        self.ring.as_mut_ptr().add(i * hw::DESC_SIZE)
+    unsafe fn rx_desc(&mut self, q: usize, i: usize) -> *mut u8 {
+        self.q[q].ring.as_mut_ptr().add(i * hw::DESC_SIZE)
     }
 
-    unsafe fn rx_ptr(&mut self, i: usize) -> *mut u8 {
-        self.bufs.as_mut_ptr().add(i * self.buf_size)
+    unsafe fn rx_ptr(&mut self, q: usize, i: usize) -> *mut u8 {
+        self.q[q].bufs.as_mut_ptr().add(i * self.buf_size)
     }
 
-    /// Write descriptors `first..first + count` for their buffers and push
-    /// them out of the cache.
-    unsafe fn rx_fill(&mut self, first: usize, count: usize) {
+    /// Write queue `q`'s descriptors `first..first + count` for their
+    /// buffers and push them out of the cache.
+    unsafe fn rx_fill(&mut self, q: usize, first: usize, count: usize) {
         for i in first..first + count {
-            let d = self.rx_desc(i);
-            hw::rx_desc_set(d, self.pool_phys + (i * self.buf_size) as u32);
+            let d = self.rx_desc(q, i);
+            hw::rx_desc_set(d, self.q[q].pool_phys + (i * self.buf_size) as u32);
         }
-        let d = self.rx_desc(first);
+        let d = self.rx_desc(q, first);
         arch::cache_flush(d, count * hw::DESC_SIZE);
     }
 
-    /// Fill the whole receive ring and start receiving: the card gets every
-    /// descriptor but the last group.
+    /// Fill every receive ring and start receiving: the card gets every
+    /// descriptor but the last group of each, RSS spreads the frames over
+    /// the queues as set (or none: everything on queue 0).
     unsafe fn rx_start(&mut self) {
-        self.rx_fill(0, self.rx_n);
-        self.next = 0;
-        self.tail = self.rx_n - RX_GROUP;
-        self.held = None;
+        self.r.rx_stop();
+        for q in 0..self.q.len() {
+            self.rx_fill(q, 0, self.rx_n);
+            let rq = &mut self.q[q];
+            rq.next = 0;
+            rq.tail = self.rx_n - RX_GROUP;
+            rq.held = None;
+            if !self.r.rx_queue_init(q, rq.ring_phys, self.rx_n, self.buf_size) {
+                serial_println!("{} unit {}: receive queue {} did not report enabled", NAME, self.u.index(), q);
+            }
+        }
+        self.u.rx_next.store(0, Ordering::Release);
+        self.u.rx_holding.store(0, Ordering::Release);
         self.u.shared.with(|s| s.rx_held = false);
-        self.r.rx_init(self.ring_phys, self.rx_n, self.sent_mode.unwrap_or(0) | self.rctl_size);
+        self.u.rx_queues.store(self.q.len() as u32, Ordering::Release);
+        self.r.rx_enable(self.sent_mode.unwrap_or(0) | self.rctl_size);
         arch::sync_barrier();
-        self.r.w(reg::RDT, self.tail as u32);
+        for q in 0..self.q.len() {
+            self.r.w(Regs::rdt(q), self.q[q].tail as u32);
+        }
+    }
+
+    /// Whether a frame waits in any queue for a read.
+    fn any_held(&self) -> bool {
+        self.q.iter().any(|q| q.held.is_some())
     }
 
     /// Bring the card's receive mode, multicast table and station address
@@ -939,7 +1631,9 @@ impl Net {
 
     /// After the card was reset: it owns no buffer any more.
     fn end_all_mappings(&mut self) {
-        self.held = None;
+        for q in self.q.iter_mut() {
+            q.held = None;
+        }
         self.u.shared.with(|s| s.rx_held = false);
     }
 
@@ -953,25 +1647,139 @@ impl Net {
             self.r.w(reg::PBA, self.pba);
             let mut sleep = Sleeper::new();
             self.r.reset(&mut |ms| sleep.ms(ms))?;
-            self.end_all_mappings();
-            self.r.init_hw();
-            self.r.fc_init(self.max_frame);
-            let _ = self.r.phy_setup();
-            self.sent_mode = None;
-            self.sent_mta = None;
-            self.sent_mac = None;
-            let station = u.shared.with(|s| s.station);
-            self.r.set_station(&station);
-            self.rx_start();
-            if let Some(tx) = tx.as_mut() {
-                tx.start();
-            }
-            u.tx_idle.store(1, Ordering::Release);
-            self.apply_rx_mode();
-            let _ = self.r.read_icr();
+            self.reinit(tx);
+            Ok(())
+        })
+    }
+
+    /// After a reset (the transmit lock held, `tx` its ring): the chip
+    /// settings, the PHY, flow control, the interrupt interval, both rings
+    /// and the receive mode, as they were set. Posted reads stay queued.
+    unsafe fn reinit(&mut self, tx: &mut Option<TxRing>) {
+        let u = self.u;
+        self.end_all_mappings();
+        self.r.init_hw();
+        self.r.w(reg::ITR, self.itr);
+        self.r.fc_init(self.max_frame);
+        let _ = self.r.phy_setup(fc_adv(self.fc_modes));
+        if self.fc_modes & x::S2XFC_AUTO == 0 {
+            let _ = self.r.fc_force(self.fc_modes & x::S2XFC_RX != 0, self.fc_modes & x::S2XFC_TX != 0);
+        }
+        self.sent_mode = None;
+        self.sent_mta = None;
+        self.sent_mac = None;
+        let station = u.shared.with(|s| s.station);
+        self.r.set_station(&station);
+        self.rx_start();
+        if let Some(tx) = tx.as_mut() {
+            tx.start();
+        }
+        u.tx_idle.store(1, Ordering::Release);
+        self.apply_rx_mode();
+        let _ = self.r.read_icr();
+        {
             self.r.enable_irqs();
-            u.irq_drained.store(u.irq_claimed.load(Ordering::Relaxed), Ordering::Relaxed);
-            u.irq_storm.store(0, Ordering::Release);
+        }
+        u.irq_drained.store(u.irq_claimed.load(Ordering::Relaxed), Ordering::Relaxed);
+        u.irq_storm.store(0, Ordering::Release);
+    }
+
+    /// Pause frames as the flow-control setting says: forced (no AUTO), or
+    /// as auto-negotiation resolved them at link up (`up`) and limited to
+    /// the directions the setting allows. Returns the mode, for the log.
+    unsafe fn fc_apply(&self, up: bool) -> &'static str {
+        let (rx, tx) = (self.fc_modes & x::S2XFC_RX != 0, self.fc_modes & x::S2XFC_TX != 0);
+        if self.fc_modes & x::S2XFC_AUTO == 0 {
+            return self.r.fc_force(rx, tx);
+        }
+        if !up {
+            return "not resolved yet (link down)";
+        }
+        let mode = self.r.fc_resolve();
+        if !(rx && tx) {
+            self.r.fc_mask(rx, tx);
+        }
+        mode
+    }
+
+    /// S2XSET_MTU and S2XSET_RSS: frames up to `mtu` bytes of packet data
+    /// each way, and RSS as `rss` says (None or 1 queue: off). The card is
+    /// reset and set up again with buffers for the size (16 KB above 1500,
+    /// as at start) and one receive queue per RSS queue: every pool that is
+    /// new is allocated first, so a failure changes nothing. Queue 0's
+    /// descriptor ring never moves (the write path's peek reads it without
+    /// a lock); only its buffers change with the size. What the card still
+    /// has to send is given up to 50 ms first; writes waiting for a slot
+    /// stay queued and are checked against the new MTU; posted reads stay
+    /// queued. The link may go down and up again (the PHY is reset with the
+    /// MAC on some chips).
+    unsafe fn rebuild(&mut self, mtu: u32) -> Result<(), String> {
+        let (buf_size, rctl_size, rx_n) = sizes_for(mtu);
+        let nq = 1;
+        let u = self.u;
+        let e = |x: amigaos4::AmigaError| alloc::format!("{}", x);
+        let resize = buf_size != self.buf_size;
+        let pools = if resize {
+            let mut rb = DmaBuffer::alloc_contiguous(rx_n * buf_size, 4096).map_err(e)?;
+            let mut tb = DmaBuffer::alloc_contiguous(TX_SLOTS * buf_size, 4096).map_err(e)?;
+            let (rmap, rphys) = map_pool(&mut rb, rx_n * buf_size, DmaDirection::FromDevice)?;
+            let (tmap, tphys) = map_pool(&mut tb, TX_SLOTS * buf_size, DmaDirection::ToDevice)?;
+            Some((rb, rmap, rphys, tb, tmap, tphys))
+        } else {
+            None
+        };
+        // Queues 1.. that are new, or whose buffers change size.
+        let mut fresh: Vec<Option<RxQ>> = Vec::new();
+        for k in 1..nq {
+            fresh.push(if resize || k >= self.q.len() { Some(RxQ::alloc(rx_n, buf_size)?) } else { None });
+        }
+        u.tx.with(|tx| -> Result<(), String> {
+            if let Some(t) = tx.as_mut() {
+                t.push_out(u, true);
+                for _ in 0..50 {
+                    if self.r.r(reg::TDH) as usize == t.tail {
+                        break;
+                    }
+                    amigaos4::timer::micro_delay(1000);
+                }
+            }
+            // The packet buffer split for the new frame size takes effect
+            // at the reset.
+            self.pba = pba_for(mtu + eth::HLEN as u32 + 4);
+            self.r.w(reg::PBA, self.pba);
+            let mut sleep = Sleeper::new();
+            self.r.reset(&mut |ms| sleep.ms(ms))?;
+            // The card no longer reaches any buffer: the pools may change.
+            if let Some((rb, rmap, rphys, tb, tmap, tphys)) = pools {
+                let q0 = &mut self.q[0];
+                q0._pool_map = None;
+                q0.bufs = rb;
+                q0._pool_map = Some(rmap);
+                q0.pool_phys = rphys;
+                arch::cache_invalidate(q0.bufs.as_mut_ptr(), rx_n * buf_size);
+                if let Some(t) = tx.as_mut() {
+                    t._pool_map = None;
+                    t.bufs = tb;
+                    t._pool_map = Some(tmap);
+                    t.phys = tphys;
+                    t.buf_size = buf_size;
+                }
+            }
+            let mut old: Vec<RxQ> = self.q.drain(1..).collect();
+            for (i, f) in fresh.into_iter().enumerate() {
+                match f {
+                    Some(q) => self.q.push(q),
+                    None => self.q.push(old.remove(0)),
+                }
+                let _ = i;
+            }
+            drop(old);
+            self.buf_size = buf_size;
+            self.rctl_size = rctl_size;
+            self.rx_n = rx_n;
+            self.max_frame = mtu + eth::HLEN as u32 + 4;
+            u.shared.with(|s| s.mtu = mtu);
+            self.reinit(tx);
             Ok(())
         })
     }
@@ -1090,23 +1898,36 @@ fn type_stats(s: &mut Shared, ptype: u32, mut f: impl FnMut(&mut Sana2PacketType
 // ---------------------------------------------------------------------------
 
 impl Net {
-    /// Take every received frame, deliver it, and give the descriptors back
-    /// in whole groups.
+    /// Take every received frame from every queue, deliver it, and give
+    /// the descriptors back in whole groups.
     unsafe fn rx(&mut self, now: TimeVal) -> u32 {
         let t0 = arch::timebase();
+        let mut n = 0;
+        for q in 0..self.q.len() {
+            n += self.rx_queue(q, now);
+        }
+        self.end_touched();
+        if n > 0 {
+            self.u.add_time(perf::RX_T, t0);
+        }
+        n
+    }
+
+    /// One queue's share of a receive pass.
+    unsafe fn rx_queue(&mut self, q: usize, now: TimeVal) -> u32 {
         let group_inv = self.u.tune.load(Ordering::Relaxed) & TUNE_RX_GROUP_INV != 0;
         // The group whose descriptors were last invalidated together.
         let mut inv_group = usize::MAX;
         let mut n = 0;
         let mut refilled = false;
         loop {
-            let i = self.next;
-            let d = self.rx_desc(i);
+            let i = self.q[q].next;
+            let d = self.rx_desc(q, i);
             let mut fresh = true;
             if group_inv {
                 let g = i / RX_GROUP;
                 if g != inv_group {
-                    arch::cache_invalidate(self.rx_desc(g * RX_GROUP), RX_GROUP * hw::DESC_SIZE);
+                    arch::cache_invalidate(self.rx_desc(q, g * RX_GROUP), RX_GROUP * hw::DESC_SIZE);
                     inv_group = g;
                 } else {
                     fresh = false;
@@ -1130,26 +1951,28 @@ impl Net {
                 // frames are off, so the card should not make those).
                 self.u.shared.with(|s| s.stats.bad_data += 1);
             } else {
-                let p = self.rx_ptr(i);
-                if self.held.is_none() {
+                let p = self.rx_ptr(q, i);
+                if self.q[q].held.is_none() {
                     arch::cache_invalidate(p, len);
                 }
                 let frame = core::slice::from_raw_parts(p, len);
                 if len > eth::HLEN + eth::MTU {
                     self.u.jumbo_rx.fetch_add(1, Ordering::Relaxed);
                 }
-                let may_hold = match self.held {
+                let may_hold = match self.q[q].held {
                     None => true,
                     Some(since) => arch::timebase().wrapping_sub(since) < self.hold_limit,
                 };
+                // No RSS on this driver: no hash.
+                let rss = (0, 0);
                 let td = arch::timebase();
-                let delivered = self.deliver(frame, now, may_hold);
+                let delivered = self.deliver(frame, now, may_hold, q as u32, rx_checksum(frame, status, errors), rss);
                 self.u.add_time(perf::RX_DELIVER_T, td);
                 if !delivered {
                     // No read for it yet: keep it (and everything behind
-                    // it) in the ring until the stack queues one.
-                    if self.held.is_none() {
-                        self.held = Some(arch::timebase());
+                    // it on this queue) in the ring until the stack queues one.
+                    if self.q[q].held.is_none() {
+                        self.q[q].held = Some(arch::timebase());
                     }
                     break;
                 }
@@ -1157,28 +1980,29 @@ impl Net {
                     self.u.count(perf::RX_ACKS);
                 }
             }
-            self.held = None;
+            let rx_n = self.rx_n;
+            let rq = &mut self.q[q];
+            rq.held = None;
             n += 1;
-            self.next = (i + 1) % self.rx_n;
-            if self.next % RX_GROUP == 0 {
+            rq.next = (i + 1) % rx_n;
+            if rq.next % RX_GROUP == 0 {
                 // A whole group is done: write it afresh (the card no
                 // longer owns any of its cache lines), and hand the card the
                 // group held back so far. This group is the new one held back.
-                let first = (self.next + self.rx_n - RX_GROUP) % self.rx_n;
-                self.rx_fill(first, RX_GROUP);
-                self.tail = first;
+                let first = (rq.next + rx_n - RX_GROUP) % rx_n;
+                rq.tail = first;
+                self.rx_fill(q, first, RX_GROUP);
                 refilled = true;
             }
         }
-        self.u.rx_next.store(self.next as u32, Ordering::Release);
-        self.u.rx_holding.store(self.held.is_some() as u32, Ordering::Release);
+        if q == 0 {
+            self.u.rx_next.store(self.q[0].next as u32, Ordering::Release);
+            self.u.rx_holding.store(self.q[0].held.is_some() as u32, Ordering::Release);
+        }
         if refilled {
             arch::sync_barrier();
-            self.r.w(reg::RDT, self.tail as u32);
+            self.r.w(Regs::rdt(q), self.q[q].tail as u32);
             self.u.count(perf::RX_NOTIFY);
-        }
-        if n > 0 {
-            self.u.add_time(perf::RX_T, t0);
         }
         n
     }
@@ -1186,18 +2010,27 @@ impl Net {
     /// Hand one frame to the openers' reads. False: the frame is of a type
     /// an opener reads, but none of its reads is queued right now and
     /// `may_hold` allows waiting: nothing was done, try again later.
-    unsafe fn deliver(&mut self, frame: &[u8], now: TimeVal, may_hold: bool) -> bool {
+    ///
+    /// Each opener gets the frame once, in its oldest posted request for
+    /// the type: a CMD_READ (any queue) or an S2X_READBATCH for `queue`.
+    ///
+    /// `csum` is the card's checksum result (S2XCS_... flags) for read
+    /// batch frames that carry an S2XFRAME_CHECKSUM item.
+    unsafe fn deliver(&mut self, frame: &[u8], now: TimeVal, may_hold: bool, queue: u32, csum: u32, rss: (u32, u32)) -> bool {
         let dst = [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]];
         let src = [frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]];
         let ptype = u16::from_be_bytes([frame[12], frame[13]]) as u32;
         let bcast = dst == eth::BROADCAST;
         let mcast = !bcast && eth::is_multicast(&dst);
         let len = frame.len() as u32;
-        // Choose the reads under the lock; copy and reply outside it.
-        let taken: Option<Vec<(S2Req, *mut Opener)>> = self.u.shared.with(|s| {
+        let fits = |rd: &Rd| rd.ptype == ptype && rd.batch.map_or(true, |b| b.queue == queue);
+        // Choose the reads under the lock; copy and reply outside it. A
+        // batch is taken out of the list while its frame is copied, and put
+        // back (in its place) if it has room for more.
+        let taken: Option<Taken> = self.u.shared.with(|s| {
             // A frame that waits is counted when it is finally taken.
             let wants = s.read_types.iter().any(|&(t, _)| t == ptype);
-            let readable = s.reads.iter().any(|r| r.packet_type() == ptype) || !s.orphans.is_empty();
+            let readable = s.reads.iter().any(fits) || !s.orphans.is_empty();
             let filtered_out = s.promisc_openers == 0
                 && ((mcast && !s.mcast_wanted(&dst)) || (!bcast && !mcast && dst != s.station));
             if s.online && wants && !readable && !filtered_out {
@@ -1213,17 +2046,17 @@ impl Net {
             }
             s.rx_held = false;
             if !s.online {
-                return Some(Vec::new());
+                return Some(Taken::new());
             }
             let promisc = s.promisc_openers > 0;
             if !promisc {
                 if mcast && !s.mcast_wanted(&dst) {
                     s.stats.mcast_rejects += 1;
-                    return Some(Vec::new());
+                    return Some(Taken::new());
                 }
                 if !bcast && !mcast && dst != s.station {
                     s.stats.rx_filtered += 1;
-                    return Some(Vec::new());
+                    return Some(Taken::new());
                 }
             }
             // Counted once past the address filter, as a card that filters
@@ -1235,13 +2068,14 @@ impl Net {
                 st.PacketsReceived += 1;
                 st.BytesReceived += len;
             });
-            let mut taken: Vec<(S2Req, *mut Opener)> = Vec::new();
+            let mut taken = Taken::new();
+            // One read per opener: once every opener has one, stop looking.
+            let openers = s.openers.len();
             let mut i = 0;
-            while i < s.reads.len() {
-                let r = s.reads[i];
-                let op = r.buffer_management() as *mut Opener;
-                if r.packet_type() == ptype && !taken.iter().any(|&(_, o)| o == op) {
-                    taken.push((r, op));
+            while i < s.reads.len() && taken.len() < openers {
+                let rd = s.reads[i];
+                if fits(&rd) && !taken.has(rd.op) {
+                    taken.push((Pick::Read(rd), rd.op));
                     s.reads.remove(i);
                 } else {
                     i += 1;
@@ -1252,8 +2086,8 @@ impl Net {
                 while i < s.orphans.len() {
                     let r = s.orphans[i];
                     let op = r.buffer_management() as *mut Opener;
-                    if !taken.iter().any(|&(_, o)| o == op) {
-                        taken.push((r, op));
+                    if !taken.has(op) {
+                        taken.push((Pick::Orphan(r), op));
                         s.orphans.remove(i);
                     } else {
                         i += 1;
@@ -1268,39 +2102,113 @@ impl Net {
             Some(taken)
         });
         let Some(taken) = taken else { return false };
-        for (r, op) in taken {
-            let raw = r.io().flags() & SANA2IOF_RAW != 0;
+        for (pick, op) in taken.iter() {
+            let bm = &(*op).bm;
+            // The request the frame's fields go into, and the one whose
+            // io_Flags (SANA2IOF_RAW) apply.
+            let (r, base) = match pick {
+                Pick::Read(rd) => match rd.batch {
+                    Some(b) => (frame_req(b.next), rd.r),
+                    None => (rd.r, rd.r),
+                },
+                Pick::Orphan(r) => (r, r),
+            };
+            let raw = base.io().flags() & SANA2IOF_RAW != 0;
             let (data, dlen) = if raw { (frame.as_ptr(), len) } else { (frame.as_ptr().add(eth::HLEN), len - eth::HLEN as u32) };
             r.set_src_mac(&src);
             r.set_dst_mac(&dst);
             r.set_packet_type(ptype);
             r.set_data_length(dlen);
             let io = r.io();
-            let mut flags = io.flags() & !(SANA2IOF_BCAST | SANA2IOF_MCAST);
+            let mut flags = if r == base { io.flags() & !(SANA2IOF_BCAST | SANA2IOF_MCAST) } else { base.io().flags() & SANA2IOF_RAW };
             if bcast {
                 flags |= SANA2IOF_BCAST;
             } else if mcast {
                 flags |= SANA2IOF_MCAST;
             }
             io.set_flags(flags);
-            let bm = &(*op).bm;
-            // S2_PacketFilter is for CMD_READ; an orphan read gets everything.
-            if io.command() == CMD_READ && !bm.filter(r, data) {
-                // The stack does not want this one: the read stays pending.
-                self.u.shared.with(|s| {
-                    if io.command() == CMD_READ { s.reads.insert(0, r) } else { s.orphans.insert(0, r) }
-                });
-                continue;
+            // S2_PacketFilter is for CMD_READ (and the CMD_READ-like frames
+            // of a read batch); an orphan read gets everything.
+            if let Pick::Read(rd) = pick {
+                if !bm.filter(r, data) {
+                    // The stack does not want this one: the read stays pending.
+                    self.u.shared.with(|s| reinsert(s, rd));
+                    continue;
+                }
             }
-            if bm.copy_to_buff(r, r.data(), data, dlen) {
-                r.reply(0, 0);
-            } else {
-                r.reply(S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR);
+            let copied = bm.copy_to_buff(r, r.data(), data, dlen);
+            if !copied {
                 signal_events(self.u, S2EVENT_ERROR | S2EVENT_RX | S2EVENT_BUFF);
+            }
+            match pick {
+                Pick::Read(mut rd) if rd.batch.is_some() => {
+                    let mut b = rd.batch.unwrap();
+                    if copied {
+                        r.set_wire_error(0);
+                        io.set_error(0);
+                    } else {
+                        r.set_wire_error(S2WERR_BUFF_ERROR);
+                        io.set_error(S2ERR_NO_RESOURCES);
+                    }
+                    // The frame's items: the checksum result, if asked for
+                    // (types the driver does not know are stepped over).
+                    let items = core::ptr::addr_of!((*(b.next as *mut x::S2XFrame)).s2xf_Items);
+                    if let Some(c) = x::find::<x::S2XFrameChecksum>(items, x::S2XFRAME_CHECKSUM) {
+                        core::ptr::addr_of_mut!((*c).s2xfc_Flags).write_unaligned(csum);
+                    }
+                    // And the RSS hash (type 0: not hashed).
+                    if let Some(h) = x::find::<x::S2XFrameRSS>(items, x::S2XFRAME_RSS) {
+                        core::ptr::addr_of_mut!((*h).s2xfr_Hash).write_unaligned(if rss.1 != 0 { rss.0 } else { 0 });
+                        core::ptr::addr_of_mut!((*h).s2xfr_HashType).write_unaligned(rss.1);
+                    }
+                    b.filled += 1;
+                    b.next = next_frame(b.next);
+                    rd.batch = Some(b);
+                    if b.filled == b.max {
+                        rd.end(0, 0);
+                    } else {
+                        self.u.shared.with(|s| reinsert(s, rd));
+                        self.touched.push(rd.r);
+                    }
+                }
+                _ => {
+                    if copied {
+                        r.reply(0, 0);
+                    } else {
+                        r.reply(S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR);
+                    }
+                }
             }
         }
         true
     }
+
+    /// The end of a receive pass: every read batch that took frames in it
+    /// and is still posted is replied (it takes what is waiting, at least
+    /// one frame). One that was replied meanwhile (full, aborted) is gone
+    /// from the list, or back with nothing filled if the stack posted it
+    /// again: both are left alone.
+    unsafe fn end_touched(&mut self) {
+        if self.touched.is_empty() {
+            return;
+        }
+        let touched = core::mem::take(&mut self.touched);
+        let done: Vec<Rd> = self.u.shared.with(|s| {
+            let mut out = Vec::new();
+            for r in touched.iter() {
+                if let Some(pos) = s.reads.iter().position(|x| x.r == *r && x.batch.map_or(false, |b| b.filled > 0)) {
+                    out.extend(s.reads.remove(pos));
+                }
+            }
+            out
+        });
+        for rd in done {
+            rd.end(0, 0);
+        }
+        self.touched = touched;
+        self.touched.clear();
+    }
+
     /// A link status change (LSC).
     unsafe fn config_changed(&mut self) {
         let (up, bps) = self.r.link();
@@ -1318,7 +2226,7 @@ impl Net {
                 serial_println!("{} unit {}: link down", NAME, self.u.index());
             }
             if up {
-                let mode = self.r.fc_resolve();
+                let mode = self.fc_apply(true);
                 self.u.shared.with(|s| s.fc_mode = mode);
                 serial_println!("{} unit {}: {}", NAME, self.u.index(), mode);
             }
@@ -1338,6 +2246,62 @@ impl Net {
 // the ring's own list; the unit task sends those as slots come back, on the
 // transmit interrupt. Lock order: the transmit lock, then the shared state;
 // never the other way round.
+//
+// An S2X_WRITEBATCH is sent the same way, frame by frame in list order with
+// one tail write for all; when slots run out part-way it waits in the same
+// list (after the frames already placed are kicked), and the unit task goes
+// on with it from the frame it stopped at.
+
+/// A write waiting for a slot: a CMD_WRITE / S2_BROADCAST / S2_MULTICAST,
+/// or a write batch with how far it got.
+#[derive(Clone, Copy)]
+enum Tx {
+    One(S2Req),
+    Batch(TxBatch),
+}
+
+#[derive(Clone, Copy)]
+struct TxBatch {
+    r: S2Req,
+    /// The next frame to send.
+    next: *mut MinNode,
+    /// Frames still to send, and frames taken (s2xb_Done).
+    left: u32,
+    done: u32,
+}
+
+impl Tx {
+    fn req(&self) -> S2Req {
+        match self {
+            Tx::One(r) => *r,
+            Tx::Batch(b) => b.r,
+        }
+    }
+
+    /// Reply it with an error (abort, offline, close): a batch with the
+    /// frames already taken counted.
+    ///
+    /// # Safety
+    /// A request the driver holds (taken out of the list).
+    unsafe fn end(self, error: i8, wire: u32) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            if let Tx::Batch(b) = self {
+                set_done(b.r, b.done);
+            }
+            self.req().reply(error, wire);
+        }
+    }
+}
+
+/// What TxRing::put did with a frame.
+enum Put {
+    Sent,
+    /// Every slot is in flight: nothing done.
+    Full,
+    /// Refused (io_Error, ios2_WireError): nothing sent.
+    Refused(i8, u32),
+}
 
 struct TxRing {
     // Mappings before their buffers: they drop (EndDMA) first.
@@ -1355,7 +2319,7 @@ struct TxRing {
     /// Descriptors filled and the card not yet told.
     unkicked: bool,
     /// Writes waiting for a slot (marked pending: replied when sent).
-    pending: VecDeque<S2Req>,
+    pending: VecDeque<Tx>,
     r: Regs,
     /// The transmit head when last sampled with descriptors waiting, and
     /// since when (timebase) it has not moved.
@@ -1371,11 +2335,31 @@ struct TxRing {
     unkicked_n: u32,
     /// The last frame filled was a jumbo frame (batching never holds one).
     last_big: bool,
+    /// Segmentation's buffers (TSO_BUFS of TSO_BUF bytes; mapping before
+    /// buffer: it drops first), their physical address, and for each the
+    /// data descriptor that last used it (free once that one is done).
+    _tso_map: Option<DmaMapping<'static>>,
+    tso: Option<DmaBuffer>,
+    tso_phys: u32,
+    tso_slot: [Option<usize>; TSO_BUFS],
 }
 
 impl TxRing {
+    /// Whether descriptor `i` may still be the card's (between the oldest
+    /// not taken back and the tail).
+    fn in_flight(&self, i: usize) -> bool {
+        (i + self.n - self.clean) % self.n < (self.tail + self.n - self.clean) % self.n
+    }
+
+    /// A segmentation buffer no descriptor in flight uses.
+    fn free_tso(&self) -> Option<usize> {
+        self.tso.as_ref()?;
+        (0..TSO_BUFS).find(|&k| self.tso_slot[k].map_or(true, |d| !self.in_flight(d)))
+    }
+
     /// Point the card at the (empty) ring and enable transmit.
     unsafe fn start(&mut self) {
+        self.tso_slot = [None; TSO_BUFS];
         self.tail = 0;
         self.clean = 0;
         self.unkicked = false;
@@ -1427,46 +2411,128 @@ impl TxRing {
     /// `finish` (quick-aware; a pending request is not quick). Returns false
     /// when every slot is in flight (the request is not ended).
     unsafe fn send(&mut self, u: &Unit, r: S2Req, now: TimeVal) -> bool {
+        match self.put(u, r, r.io().command(), r.buffer_management() as *mut Opener, now, None, None) {
+            Put::Sent => r.finish(0, 0),
+            Put::Full => return false,
+            Put::Refused(e, w) => r.finish(e, w),
+        }
+        true
+    }
+
+    /// Go on with a write batch: send its frames in list order until one
+    /// is refused, the slots run out, or all are sent. True: the batch is
+    /// ended (replied, quick-aware, with s2xb_Done); false: it waits for
+    /// slots. A refused frame's request gets the error and so does the
+    /// batch; the frames after it are left untouched.
+    unsafe fn send_batch(&mut self, u: &Unit, b: &mut TxBatch, now: TimeVal) -> bool {
+        let op = b.r.buffer_management() as *mut Opener;
+        while b.left > 0 {
+            let fr = frame_req(b.next);
+            // A frame is a CMD_WRITE unless its request says broadcast or
+            // multicast (its io_Command is not otherwise used).
+            let cmd = match fr.io().command() {
+                S2_BROADCAST => S2_BROADCAST,
+                S2_MULTICAST => S2_MULTICAST,
+                _ => CMD_WRITE,
+            };
+            match self.put(u, fr, cmd, op, now, tx_csum_item(b.next), tx_seg_item(b.next)) {
+                Put::Sent => {
+                    fr.io().set_error(0);
+                    fr.set_wire_error(0);
+                    b.done += 1;
+                    b.left -= 1;
+                    b.next = next_frame(b.next);
+                }
+                Put::Full => return false,
+                Put::Refused(e, w) => {
+                    fr.io().set_error(e);
+                    fr.set_wire_error(w);
+                    set_done(b.r, b.done);
+                    b.r.finish(e, w);
+                    return true;
+                }
+            }
+        }
+        set_done(b.r, b.done);
+        b.r.finish(0, 0);
+        true
+    }
+
+    /// Place one frame (request `r`, command `cmd`, copied through opener
+    /// `op`'s buffer management) in the ring, without replying anything.
+    ///
+    /// `csum` and `seg` are a write batch frame's checksum and segmentation
+    /// requests (none for CMD_WRITE).
+    unsafe fn put(&mut self, u: &Unit, r: S2Req, cmd: u16, op: *mut Opener, now: TimeVal, csum: Option<TxCsum>, seg: Option<TxSeg>) -> Put {
         let io = r.io();
-        let cmd = io.command();
         let (online, configured, station, mtu) = u.shared.with(|s| (s.online, s.configured, s.station, s.mtu));
         if !configured {
-            r.finish(S2ERR_BAD_STATE, S2WERR_NOT_CONFIGURED);
-            return true;
+            return Put::Refused(S2ERR_BAD_STATE, S2WERR_NOT_CONFIGURED);
         }
         if !online {
-            r.finish(S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
-            return true;
+            return Put::Refused(S2ERR_OUTOFSERVICE, S2WERR_UNIT_OFFLINE);
         }
         if u.out_of_service.load(Ordering::Acquire) != 0 {
             // Resting between recovery tries: the ring is not being served.
-            r.finish(S2ERR_OUTOFSERVICE, S2WERR_RCVREL_HDW_ERR);
-            return true;
+            return Put::Refused(S2ERR_OUTOFSERVICE, S2WERR_RCVREL_HDW_ERR);
         }
         let raw = io.flags() & SANA2IOF_RAW != 0;
         let dlen = r.data_length() as usize;
         let frame_len = if raw { dlen } else { eth::HLEN + dlen };
-        if (raw && (dlen < eth::HLEN || dlen > eth::HLEN + mtu as usize)) || (!raw && dlen > mtu as usize) {
-            r.finish(S2ERR_MTU_EXCEEDED, S2WERR_GENERIC_ERROR);
-            return true;
+        if seg.is_some() {
+            // A segmented send: larger than the MTU allowed, up to
+            // TSO_MAX_DATA, with a TCP checksum request (the spec's rule).
+            if self.tso.is_none() {
+                return Put::Refused(S2ERR_NOT_SUPPORTED, S2WERR_GENERIC_ERROR);
+            }
+            if dlen > TSO_MAX_DATA as usize || (raw && dlen < eth::HLEN) {
+                return Put::Refused(S2ERR_MTU_EXCEEDED, S2WERR_GENERIC_ERROR);
+            }
+            if !csum.map_or(false, |c| c.flags & x::S2XCS_FILL_L4 != 0) {
+                return Put::Refused(S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR);
+            }
+        } else if (raw && (dlen < eth::HLEN || dlen > eth::HLEN + mtu as usize)) || (!raw && dlen > mtu as usize) {
+            return Put::Refused(S2ERR_MTU_EXCEEDED, S2WERR_GENERIC_ERROR);
         }
         let dst = match cmd {
             S2_BROADCAST => eth::BROADCAST,
             _ => r.dst_mac(),
         };
         if cmd == S2_MULTICAST && (!eth::is_multicast(&dst) || dst == eth::BROADCAST) {
-            r.finish(S2ERR_BAD_ADDRESS, S2WERR_BAD_MULTICAST);
-            return true;
+            return Put::Refused(S2ERR_BAD_ADDRESS, S2WERR_BAD_MULTICAST);
         }
+        // A frame with an offload takes two descriptors: a context
+        // descriptor (slot i, its buffer unused) and the data descriptor
+        // (slot i + 1, with that slot's buffer), so buffers stay one per
+        // descriptor.
+        // A segmented send goes into a segmentation buffer instead (with its
+        // own context descriptor too).
+        let offload = seg.is_some() || csum.map_or(false, |c| c.flags & (x::S2XCS_FILL_IP | x::S2XCS_FILL_L4) != 0);
         let i = self.tail;
-        if (i + 1) % self.n == self.clean {
-            return false;
+        let need = if offload { 2 } else { 1 };
+        if self.free_slots() < need {
+            return Put::Full;
         }
-        if frame_len.max(60) > self.buf_size {
-            r.finish(S2ERR_MTU_EXCEEDED, S2WERR_GENERIC_ERROR);
-            return true;
-        }
-        let f = self.bufs.as_mut_ptr().add(i * self.buf_size);
+        let j = if offload { (i + 1) % self.n } else { i };
+        let (f, phys, tso_k) = if seg.is_some() {
+            let k = match self.free_tso() {
+                Some(k) => k,
+                None => {
+                    self.reclaim();
+                    match self.free_tso() {
+                        Some(k) => k,
+                        None => return Put::Full,
+                    }
+                }
+            };
+            let Some(pool) = self.tso.as_mut() else { return Put::Full };
+            (pool.as_mut_ptr().add(k * TSO_BUF), self.tso_phys + (k * TSO_BUF) as u32, Some(k))
+        } else {
+            if frame_len.max(60) > self.buf_size {
+                return Put::Refused(S2ERR_MTU_EXCEEDED, S2WERR_GENERIC_ERROR);
+            }
+            (self.bufs.as_mut_ptr().add(j * self.buf_size), self.phys + (j * self.buf_size) as u32, None)
+        };
         let payload = if raw {
             f
         } else {
@@ -1477,23 +2543,60 @@ impl TxRing {
             *f.add(13) = t[1];
             f.add(eth::HLEN)
         };
-        let op = r.buffer_management() as *mut Opener;
         if !(*op).bm.copy_from_buff(r, payload, r.data(), dlen as u32) {
-            r.finish(S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR);
             signal_events(u, S2EVENT_ERROR | S2EVENT_TX | S2EVENT_BUFF);
-            return true;
+            return Put::Refused(S2ERR_NO_RESOURCES, S2WERR_BUFF_ERROR);
         }
-        // Pad to the 60-byte Ethernet minimum (the card pads too, TCTL.PSP;
-        // zeros here keep old data off the wire).
-        let wire = frame_len.max(60);
+        // The checksums asked for: planned for the card, or (what it
+        // cannot express) computed here, before the buffer leaves the cache.
+        let fr = core::slice::from_raw_parts_mut(f, frame_len);
+        let plan = match (seg, csum) {
+            (Some(s), Some(c)) => match tso_plan(fr, raw, s, c, mtu) {
+                Some(p) => Some(p),
+                None => return Put::Refused(S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR),
+            },
+            (None, Some(c)) if offload => match tx_offload(fr, raw, c) {
+                Some(p) => Some(p),
+                None => return Put::Refused(S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR),
+            },
+            _ => None,
+        };
+        // A plain frame is padded to the 60-byte Ethernet minimum here
+        // (zeros keep old buffer data off the wire). A frame with an
+        // offload (checksums, segmentation) goes to the card at exactly its
+        // length and the card pads it on the wire (TCTL.PSP), as Intel's
+        // drivers do: the card works from the data it fetched, and QEMU's
+        // emulated cards, inserting the IPv4 header checksum, rewrite the
+        // IP total length as everything fetched after the IP header and
+        // sum the transport checksum over it. With the padding included, a 54-byte
+        // TCP ACK left as a segment with 6 bytes of zeros (the peer took
+        // them as data) or with a wrong checksum.
+        let wire = if offload { frame_len } else { frame_len.max(60) };
         if wire > frame_len {
             core::ptr::write_bytes(f.add(frame_len), 0, wire - frame_len);
         }
         arch::cache_flush(f, wire);
-        let d = self.ring.as_mut_ptr().add(i * hw::DESC_SIZE);
-        hw::tx_desc_set(d, self.phys + (i * self.buf_size) as u32, wire as u16);
-        arch::cache_flush(d, hw::DESC_SIZE);
-        self.tail = (i + 1) % self.n;
+        if let Some(k) = tso_k {
+            self.tso_slot[k] = Some(j);
+        }
+        match plan {
+            Some(p) => {
+                let c = self.ring.as_mut_ptr().add(i * hw::DESC_SIZE);
+                hw::tx_ctx_set(c, eth::HLEN as u32, p.iplen, p.tucmd, p.mss, p.l4len, p.paylen);
+                let d = self.ring.as_mut_ptr().add(j * hw::DESC_SIZE);
+                hw::tx_desc_set_offload(d, phys, wire as u32, p.popts, p.mss != 0);
+                // Both descriptors (they may lie in two cache lines).
+                arch::cache_flush(c, hw::DESC_SIZE);
+                arch::cache_flush(d, hw::DESC_SIZE);
+                u.count(perf::TX_OFFLOADS);
+            }
+            None => {
+                let d = self.ring.as_mut_ptr().add(i * hw::DESC_SIZE);
+                hw::tx_desc_set(d, phys, wire as u16);
+                arch::cache_flush(d, hw::DESC_SIZE);
+            }
+        }
+        self.tail = (j + 1) % self.n;
         self.unkicked = true;
         self.unkicked_n += 1;
         self.last_big = frame_len > eth::HLEN + eth::MTU;
@@ -1514,8 +2617,7 @@ impl TxRing {
                 st.BytesSent += frame_len as u32;
             });
         });
-        r.finish(0, 0);
-        true
+        Put::Sent
     }
 
     /// Tell the card about the filled descriptors (the tail register).
@@ -1549,13 +2651,63 @@ impl TxRing {
 
     /// Send what waits for a slot, then push everything out.
     unsafe fn flush(&mut self, u: &Unit, now: TimeVal) {
-        while let Some(&r) = self.pending.front() {
-            if !self.send(u, r, now) {
-                break;
+        while let Some(t) = self.pending.pop_front() {
+            match t {
+                Tx::One(r) => {
+                    if !self.send(u, r, now) {
+                        self.pending.push_front(Tx::One(r));
+                        break;
+                    }
+                }
+                Tx::Batch(mut b) => {
+                    if !self.send_batch(u, &mut b, now) {
+                        self.pending.push_front(Tx::Batch(b));
+                        break;
+                    }
+                }
             }
-            self.pending.pop_front();
         }
         self.push_out(u, true);
+    }
+}
+
+/// BeginIO's S2X_WRITEBATCH (checked): send it at once in the caller's
+/// task, as far as slots allow; the rest waits for the unit task.
+unsafe fn tx_batch_from_caller(u: &Unit, r: S2Req, first: *mut MinNode, count: u32) {
+    let now = u.now();
+    let mut b = TxBatch { r, next: first, left: count, done: 0 };
+    let state = u.tx.with(|tx| {
+        let Some(tx) = tx.as_mut() else { return None };
+        if u.tune.load(Ordering::Relaxed) & TUNE_LAZY_RECLAIM == 0 || tx.free_slots() < (count as usize).max(TX_RECLAIM_BELOW) {
+            tx.reclaim();
+        }
+        if tx.pending.is_empty() && tx.send_batch(u, &mut b, now) {
+            tx.push_out(u, true);
+            return Some(true);
+        }
+        // Frames already placed go to the card now, so their slots come
+        // back while the rest waits.
+        tx.push_out(u, true);
+        r.io().mark_pending();
+        tx.pending.push_back(Tx::Batch(b));
+        Some(false)
+    });
+    match state {
+        None => r.finish(IOERR_UNITBUSY, 0),
+        Some(true) => {
+            if rx_peek(u) {
+                if u.tune.load(Ordering::Relaxed) & TUNE_RX_IN_WRITER != 0 && rx_in_writer(u) {
+                    u.count(perf::RX_BY_WRITER);
+                } else {
+                    u.count(perf::PEEK_WAKES);
+                    u.worker.wake();
+                }
+            }
+        }
+        Some(false) => {
+            u.shared.with(|s| s.stats.tx_waits += 1);
+            u.worker.wake();
+        }
     }
 }
 
@@ -1574,7 +2726,7 @@ unsafe fn tx_from_caller(u: &Unit, r: S2Req) {
             return Some(true);
         }
         r.io().mark_pending();
-        tx.pending.push_back(r);
+        tx.pending.push_back(Tx::One(r));
         Some(false)
     });
     match state {
@@ -1627,7 +2779,7 @@ unsafe fn rx_in_writer(u: &Unit) -> bool {
         if let Some(net) = (*u.net.get()).as_mut() {
             net.rx(u.now());
             done = true;
-            if net.held.is_some() {
+            if net.any_held() {
                 // A frame waits for a read: the unit task keeps the hold
                 // timer, so it must look.
                 u.worker.wake();
@@ -1660,14 +2812,19 @@ unsafe fn tx_service(u: &Unit, now: TimeVal) {
 
 /// Abort every pending read and orphan read, and what waits to be sent.
 unsafe fn abort_traffic(u: &Unit, net: &mut Net, error: i8, wire: u32) {
+    // Read batches touched in a receive pass are replied at its end; the
+    // unit task (the only caller) is between passes.
+    net.touched.clear();
     let (reads, orphans) = u.shared.with(|s| (core::mem::take(&mut s.reads), core::mem::take(&mut s.orphans)));
-    for r in reads.into_iter().chain(orphans) {
+    for rd in reads {
+        rd.end(error, wire);
+    }
+    for r in orphans {
         r.reply(error, wire);
     }
-    let _ = net;
     let pending = u.tx.with(|tx| tx.as_mut().map(|t| core::mem::take(&mut t.pending)).unwrap_or_default());
-    for r in pending {
-        r.reply(error, wire);
+    for t in pending {
+        t.end(error, wire);
     }
 }
 
@@ -1819,6 +2976,7 @@ unsafe fn serve(u: &'static Unit, net: &mut Net, r: S2Req, timer: &mut AmigaTime
             }
             r.reply(0, 0);
         }
+        x::S2X_CONFIGURE => configure(u, net, r),
         _cmd => {
             #[cfg(feature = "diag")]
             if serve_diag(u, net, r) {
@@ -1826,6 +2984,138 @@ unsafe fn serve(u: &'static Unit, net: &mut Net, r: S2Req, timer: &mut AmigaTime
             }
             r.reply(IOERR_NOCMD, 0)
         }
+    }
+}
+
+/// S2X_CONFIGURE (the unit task): read the settings (S2XCF_READ), or
+/// check every item and then apply them in list order, writing back the
+/// values applied. A refusal changes nothing and points s2xc_Failed at the
+/// item: an unknown type (S2ERR_NOT_SUPPORTED), an item too short or a
+/// value outside the capability (S2ERR_BAD_ARGUMENT), the MTU while a
+/// receive request is posted (S2ERR_BAD_STATE). A change sends
+/// S2EVENT_CONFIGCHANGED.
+unsafe fn configure(u: &'static Unit, net: &mut Net, r: S2Req) {
+    use core::ptr::{addr_of, addr_of_mut};
+    let c = r.stat_data() as *mut x::S2XConfigure;
+    if c.is_null() {
+        r.reply(S2ERR_BAD_ARGUMENT, S2WERR_NULL_POINTER);
+        return;
+    }
+    if (addr_of!((*c).s2xc_Size).read_unaligned() as usize) < core::mem::size_of::<x::S2XConfigure>() {
+        r.reply(IOERR_BADLENGTH, S2WERR_BAD_STATDATA);
+        return;
+    }
+    addr_of_mut!((*c).s2xc_Failed).write_unaligned(null_mut());
+    let read = addr_of!((*c).s2xc_Flags).read_unaligned() & x::S2XCF_READ != 0;
+    let list = addr_of!((*c).s2xc_Items);
+    let refuse = |it: *mut x::S2XItem, e: i8, w: u32| {
+        addr_of_mut!((*c).s2xc_Failed).write_unaligned(it);
+        r.reply(e, w);
+    };
+    // Check everything first.
+    let posted = u.shared.with(|s| !s.reads.is_empty() || !s.orphans.is_empty());
+    for it in x::items(list) {
+        let ty = addr_of!((*it).s2xi_Type).read_unaligned();
+        let size = addr_of!((*it).s2xi_Size).read_unaligned() as usize;
+        let need = match ty {
+            x::S2XSET_MTU => core::mem::size_of::<x::S2XSetMTU>(),
+            x::S2XSET_MODERATION => core::mem::size_of::<x::S2XSetModeration>(),
+            x::S2XSET_FLOWCONTROL => core::mem::size_of::<x::S2XSetFlowControl>(),
+            _ => {
+                refuse(it, S2ERR_NOT_SUPPORTED, S2WERR_GENERIC_ERROR);
+                return;
+            }
+        };
+        if size < need {
+            refuse(it, S2ERR_BAD_ARGUMENT, S2WERR_BAD_STATDATA);
+            return;
+        }
+        if read {
+            continue;
+        }
+        let bad = match ty {
+            x::S2XSET_MTU => {
+                let v = addr_of!((*(it as *mut x::S2XSetMTU)).s2xsm_MTU).read_unaligned();
+                if posted {
+                    // Buffers posted for the old MTU: the stack aborts its
+                    // reads first.
+                    refuse(it, S2ERR_BAD_STATE, S2WERR_GENERIC_ERROR);
+                    return;
+                }
+                !(MTU_MIN..=JUMBO_MTU_MAX).contains(&v)
+            }
+            x::S2XSET_MODERATION => addr_of!((*(it as *mut x::S2XSetModeration)).s2xso_RxMicros).read_unaligned() > MODERATION_MAX_US,
+            _ => addr_of!((*(it as *mut x::S2XSetFlowControl)).s2xsf_Modes).read_unaligned() & !(x::S2XFC_RX | x::S2XFC_TX | x::S2XFC_AUTO) != 0,
+        };
+        if bad {
+            refuse(it, S2ERR_BAD_ARGUMENT, S2WERR_GENERIC_ERROR);
+            return;
+        }
+    }
+    // Read, or apply in list order; either way each item ends up holding
+    // the value in force.
+    let mut changed = false;
+    for it in x::items(list) {
+        match addr_of!((*it).s2xi_Type).read_unaligned() {
+            x::S2XSET_MTU => {
+                let p = addr_of_mut!((*(it as *mut x::S2XSetMTU)).s2xsm_MTU);
+                let cur = u.shared.with(|s| s.mtu);
+                if !read && p.read_unaligned() != cur {
+                    let v = p.read_unaligned();
+                    if let Err(e) = net.rebuild(v) {
+                        serial_println!("{} unit {}: MTU {} not set: {}", NAME, u.index(), v, e);
+                        refuse(it, S2ERR_NO_RESOURCES, S2WERR_GENERIC_ERROR);
+                        if changed {
+                            signal_events(u, S2EVENT_CONFIGCHANGED);
+                        }
+                        return;
+                    }
+                    serial_println!("{} unit {}: MTU {}", NAME, u.index(), v);
+                    changed = true;
+                }
+                p.write_unaligned(u.shared.with(|s| s.mtu));
+            }
+            x::S2XSET_MODERATION => {
+                let m = it as *mut x::S2XSetModeration;
+                if !read {
+                    // One interval for both directions (no S2XMOD_TX), in
+                    // the card's 256 ns steps (rounded).
+                    let us = addr_of!((*m).s2xso_RxMicros).read_unaligned();
+                    let v = ((us * 125 + 16) / 32).min(0xFFFF);
+                    if v != net.itr {
+                        net.r.set_itr(v);
+                        net.itr = net.r.itr();
+                        changed = true;
+                    }
+                }
+                let us = (net.itr * 32 + 62) / 125;
+                addr_of_mut!((*m).s2xso_RxMicros).write_unaligned(us);
+                addr_of_mut!((*m).s2xso_TxMicros).write_unaligned(us);
+            }
+            _ => {
+                let f = it as *mut x::S2XSetFlowControl;
+                if !read {
+                    let want = addr_of!((*f).s2xsf_Modes).read_unaligned();
+                    if want != net.fc_modes {
+                        net.fc_modes = want;
+                        // The advertisement (auto-negotiation restarts if it
+                        // changes: the link goes down and up), then the
+                        // mode: forced now, or resolved at link up.
+                        let _ = net.r.phy_setup(fc_adv(want));
+                        let (up, _) = net.r.link();
+                        let mode = net.fc_apply(up);
+                        u.shared.with(|s| s.fc_mode = mode);
+                        serial_println!("{} unit {}: flow control 0x{:x}: {}", NAME, u.index(), want, mode);
+                        changed = true;
+                    }
+                }
+                addr_of_mut!((*f).s2xsf_Modes).write_unaligned(net.fc_modes);
+            }
+        }
+    }
+    r.reply(0, 0);
+    if changed {
+        signal_events(u, S2EVENT_CONFIGCHANGED);
     }
 }
 
@@ -1863,6 +3153,7 @@ unsafe fn serve_diag(u: &'static Unit, net: &mut Net, r: S2Req) -> bool {
         E1000E_CMD_ITR => {
             let v = r.wire_error() & 0xFFFF;
             net.r.w(reg::ITR, v);
+            net.itr = v;
             xlog!("unit {}: ITR {} ({} interrupts/s at most)", u.index(), v, if v == 0 { 0 } else { 3_906_250 / v });
             r.reply(0, 0);
         }
@@ -2014,7 +3305,7 @@ unsafe fn diag_report(u: &'static Unit, net: &mut Net) -> String {
     let (st, fc, hwc, station) = u.shared.with(|s| (s.stats, s.fc_mode, s.hw, s.station));
     let _ = writeln!(t, "station {}, {}", hex_mac(&station), fc);
     let _ = writeln!(t, "rx: next {} tail {} held {}; tx: tail {} clean {} waiting writes {}{}",
-        net.next, net.tail, net.held.is_some(), tx_tail, tx_clean, pend, if mute { " (MUTED)" } else { "" });
+        net.q[0].next, net.q[0].tail, net.any_held(), tx_tail, tx_clean, pend, if mute { " (MUTED)" } else { "" });
     let _ = writeln!(t, "irq: raised {} claimed {} passed on {}; sent {} received {} recoveries {}",
         u.irq_raised.load(Ordering::Relaxed), u.irq_claimed.load(Ordering::Relaxed),
         u.irq_passed_on.load(Ordering::Relaxed), st.tx_packets, st.rx_packets, st.recoveries);
@@ -2289,7 +3580,7 @@ extern "C" fn unit_task(n: u32) {
                 }
                 // A held frame is looked at again soon even if no read
                 // comes, so it is dropped after HOLD_MS at the latest.
-                if net.held.is_some() && holdt.is_done() {
+                if net.any_held() && holdt.is_done() {
                     holdt.finish();
                     holdt.start(TimerVal::from_millis(HOLD_POLL_MS));
                 }
@@ -2347,7 +3638,7 @@ extern "C" fn unit_task(n: u32) {
                         let (tt, tc) = u.tx.with(|tx| tx.as_ref().map(|x| (x.tail, x.clean)).unwrap_or((0, 0)));
                         serial_println!(
                             "{} unit {}: [dbg] STATUS {:08x} ICS {:08x} RDH {} RDT {} next {} | TDH {} TDT {} tail {} clean {} | irq {}/{}/{} peek {}",
-                            NAME, n, net.r.r(reg::STATUS), net.r.r(reg::ICS), net.r.r(reg::RDH), net.r.r(reg::RDT), net.next,
+                            NAME, n, net.r.r(reg::STATUS), net.r.r(reg::ICS), net.r.r(reg::RDH), net.r.r(reg::RDT), net.q[0].next,
                             net.r.r(reg::TDH), net.r.r(reg::TDT), tt, tc,
                             u.irq_raised.load(Ordering::Relaxed), u.irq_claimed.load(Ordering::Relaxed),
                             u.irq_passed_on.load(Ordering::Relaxed), u.perf[perf::PEEK_WAKES].load(Ordering::Relaxed)
@@ -2534,6 +3825,7 @@ unsafe fn start_unit(u: &'static Unit) -> Result<(), String> {
         u.cmdq_destroy();
         return Err("CreateTask failed".into());
     }
+    u.caps.store(Box::into_raw(Caps::build(u.tx.with(|t| t.as_ref().map_or(false, |t| t.tso.is_some())))), Ordering::Release);
     u.running.store(1, Ordering::Release);
     if RUNNING_UNITS.fetch_add(1, Ordering::AcqRel) == 0 {
         QUIESCED_ALL.store(0, Ordering::Release);
@@ -2639,6 +3931,11 @@ unsafe fn stop_unit(u: &'static Unit) -> Result<(), String> {
     let leftover = u.shared.with(|s| core::mem::replace(s, Shared::new()));
     drop(leftover);
     u.cmdq_destroy();
+    // The capability items: no opener is left to read them.
+    let caps = u.caps.swap(null_mut(), Ordering::AcqRel);
+    if !caps.is_null() {
+        drop(Box::from_raw(caps));
+    }
     let dev = u.dev.load(Ordering::Acquire);
     core::ptr::write(u as *const Unit as *mut Unit, Unit::NEW);
     u.dev.store(dev, Ordering::Release);
@@ -2683,7 +3980,8 @@ pub extern "C" fn rust_net_init() -> i32 {
         }
         let m = sys::exec_alloc_sys_object(sys::ASOT_MUTEX, [TagItem { ti_Tag: sys::TAG_DONE, ti_Data: 0 }].as_ptr());
         if m.is_null() {
-            for dev in cards {
+            for (dev, claim) in cards {
+                release_claim(claim);
                 pci!(dev, Unlock);
                 sys::wrappers::pci::pci_free_device(dev);
             }
@@ -2691,8 +3989,9 @@ pub extern "C" fn rust_net_init() -> i32 {
         }
         OPEN_LOCK.store(m as *mut c_void, Ordering::Release);
         let count = cards.len();
-        for (i, dev) in cards.into_iter().enumerate() {
+        for (i, (dev, claim)) in cards.into_iter().enumerate() {
             unit(i).dev.store(dev, Ordering::Release);
+            CLAIMS[i].store(claim, Ordering::Release);
         }
         NUNITS.store(count as u32, Ordering::Release);
         #[cfg(feature = "diag")]
@@ -2717,6 +4016,9 @@ pub extern "C" fn rust_net_expunge() -> i32 {
                 pci!(dev, Unlock);
                 sys::wrappers::pci::pci_free_device(dev);
             }
+        }
+        for c in &CLAIMS {
+            release_claim(c.swap(null_mut(), Ordering::AcqRel));
         }
         NUNITS.store(0, Ordering::Release);
         let m = OPEN_LOCK.swap(null_mut(), Ordering::AcqRel);
@@ -2811,8 +4113,8 @@ pub extern "C" fn rust_dev_close(ior: *mut IORequest) {
             if req_len(ior) >= S2REQ_SIZE {
                 let r = S2Req::from_raw(ior).unwrap();
                 let op = r.buffer_management() as *mut Opener;
-                let (found, leftover) = u.shared.with(|s| {
-                    let Some(pos) = s.openers.iter().position(|&o| o == op) else { return (false, Vec::new()) };
+                let (found, left_reads, leftover) = u.shared.with(|s| {
+                    let Some(pos) = s.openers.iter().position(|&o| o == op) else { return (false, Vec::new(), Vec::new()) };
                     s.openers.remove(pos);
                     s.read_types.retain(|&(_, o)| o != op);
                     s.tracked.retain(|&(_, _, o)| o != op);
@@ -2825,7 +4127,16 @@ pub extern "C" fn rust_dev_close(ior: *mut IORequest) {
                     // Requests the stack left behind (it should not).
                     let mine = |r: &S2Req| r.buffer_management() as *mut Opener == op;
                     let mut left = Vec::new();
-                    for list in [&mut s.reads, &mut s.orphans, &mut s.events, &mut s.samples] {
+                    let mut left_reads = Vec::new();
+                    let mut i = 0;
+                    while i < s.reads.len() {
+                        if mine(&s.reads[i].r) {
+                            left_reads.extend(s.reads.remove(i));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    for list in [&mut s.orphans, &mut s.events, &mut s.samples] {
                         let mut i = 0;
                         while i < list.len() {
                             if mine(&list[i]) {
@@ -2835,20 +4146,23 @@ pub extern "C" fn rust_dev_close(ior: *mut IORequest) {
                             }
                         }
                     }
-                    (true, left)
+                    (true, left_reads, left)
                 });
+                for rd in left_reads {
+                    rd.end(IOERR_ABORTED, 0);
+                }
                 for r in leftover {
                     r.reply(IOERR_ABORTED, 0);
                 }
                 // Writes still waiting for a transmit slot would be copied
                 // through this opener's buffer management after it is freed.
                 if found {
-                    let mine: Vec<S2Req> = u.tx.with(|tx| {
+                    let mine: Vec<Tx> = u.tx.with(|tx| {
                         let Some(t) = tx.as_mut() else { return Vec::new() };
                         let mut out = Vec::new();
                         let mut i = 0;
                         while i < t.pending.len() {
-                            if t.pending[i].buffer_management() as *mut Opener == op {
+                            if t.pending[i].req().buffer_management() as *mut Opener == op {
                                 out.push(t.pending.remove(i).unwrap());
                             } else {
                                 i += 1;
@@ -2856,8 +4170,8 @@ pub extern "C" fn rust_dev_close(ior: *mut IORequest) {
                         }
                         out
                     });
-                    for r in mine {
-                        r.reply(IOERR_ABORTED, 0);
+                    for t in mine {
+                        t.end(IOERR_ABORTED, 0);
                     }
                 }
                 if found {
@@ -2876,19 +4190,21 @@ pub extern "C" fn rust_dev_close(ior: *mut IORequest) {
 }
 
 /// NSCMD_DEVICEQUERY's command list.
-static SUPPORTED_COMMANDS: [u16; 27] = [
+static SUPPORTED_COMMANDS: [u16; 30] = [
     CMD_READ, CMD_WRITE, CMD_FLUSH,
     S2_DEVICEQUERY, S2_GETSTATIONADDRESS, S2_CONFIGINTERFACE,
     S2_ADDMULTICASTADDRESS, S2_DELMULTICASTADDRESS, S2_MULTICAST, S2_BROADCAST,
     S2_TRACKTYPE, S2_UNTRACKTYPE, S2_GETTYPESTATS, S2_GETSPECIALSTATS, S2_GETGLOBALSTATS,
     S2_ONEVENT, S2_READORPHAN, S2_ONLINE, S2_OFFLINE,
     S2_ADDMULTICASTADDRESSES, S2_DELMULTICASTADDRESSES, S2_GETEXTENDEDGLOBALSTATS,
-    S2_SAMPLE_THROUGHPUT, S2_SANA2HOOK, NSCMD_DEVICEQUERY, 0, 0,
+    S2_SAMPLE_THROUGHPUT, S2_SANA2HOOK, NSCMD_DEVICEQUERY,
+    // The SANA-II extensions (sana2ext).
+    x::S2X_QUERY, x::S2X_READBATCH, x::S2X_WRITEBATCH, x::S2X_CONFIGURE, 0,
 ];
 
 /// S2_GETSPECIALSTATS' record names.
 /// The order is the record types (index + 1): add at the end only.
-static SPECIAL_NAMES: [&[u8]; 24] = [
+static SPECIAL_NAMES: [&[u8]; 25] = [
     amigaos4::amstr!("Frames dropped: no read pending"),
     amigaos4::amstr!("Frames for other stations dropped"),
     amigaos4::amstr!("Multicast frames for groups not added"),
@@ -2913,6 +4229,7 @@ static SPECIAL_NAMES: [&[u8]; 24] = [
     amigaos4::amstr!("Receive passes run by a writer"),
     amigaos4::amstr!("Unit task priority changes"),
     amigaos4::amstr!("Transmit tail writes put off (batching)"),
+    amigaos4::amstr!("Frames sent with checksum offload"),
 ];
 
 const ALL_EVENTS: u32 = (1 << 11) - 1;
@@ -2928,7 +4245,7 @@ pub extern "C" fn rust_dev_begin_io(ior: *mut IORequest) {
     let cmd = io.command();
     unsafe {
         if cmd == NSCMD_DEVICEQUERY {
-            let (e, n) = answer_device_query(io, NSDEVTYPE_SANA2, 0, &SUPPORTED_COMMANDS[..26]);
+            let (e, n) = answer_device_query(io, NSDEVTYPE_SANA2, 0, &SUPPORTED_COMMANDS);
             io.finish(e, n);
             return;
         }
@@ -2944,21 +4261,36 @@ pub extern "C" fn rust_dev_begin_io(ior: *mut IORequest) {
         }
         let op = bm as *mut Opener;
         match cmd {
-            CMD_READ | S2_READORPHAN => {
+            CMD_READ | S2_READORPHAN | x::S2X_READBATCH => {
                 if !(*op).bm.complete() {
                     r.finish(S2ERR_BAD_STATE, S2WERR_FUNCTIONS_MISSING);
                     return;
                 }
+                let batch = if cmd == x::S2X_READBATCH {
+                    match check_batch(r, u.rx_queues.load(Ordering::Acquire)) {
+                        Ok((first, max, queue)) => Some(RxBatch { next: first, filled: 0, max, queue }),
+                        Err((e, w)) => {
+                            r.finish(e, w);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 io.mark_pending();
                 let wake = u.shared.with(|s| {
-                    if cmd == CMD_READ {
+                    if cmd == S2_READORPHAN {
+                        s.orphans.push(r);
+                    } else {
+                        // A read batch counts as a read of its type: a frame
+                        // of it that finds none posted waits in the ring.
                         let t = r.packet_type();
-                        if !s.read_types.iter().any(|&(x, o)| x == t && o == op) {
+                        if !s.read_types.iter().any(|&(ty, o)| ty == t && o == op) {
                             s.read_types.push((t, op));
                         }
-                        s.reads.push(r);
-                    } else {
-                        s.orphans.push(r);
+                        let seq = s.seq;
+                        s.seq = seq.wrapping_add(1);
+                        s.reads.push_back(Rd { r, seq, ptype: t, op, batch });
                     }
                     s.rx_held
                 });
@@ -2973,8 +4305,46 @@ pub extern "C" fn rust_dev_begin_io(ior: *mut IORequest) {
                 }
                 tx_from_caller(u, r);
             }
+            x::S2X_WRITEBATCH => {
+                if !(*op).bm.complete() {
+                    r.finish(S2ERR_BAD_STATE, S2WERR_FUNCTIONS_MISSING);
+                    return;
+                }
+                match check_batch(r, TX_QUEUES) {
+                    Ok((first, count, _queue)) => tx_batch_from_caller(u, r, first, count),
+                    Err((e, w)) => r.finish(e, w),
+                }
+            }
+            x::S2X_QUERY => {
+                let q = r.stat_data() as *mut x::S2XQuery;
+                let caps = u.caps.load(Ordering::Acquire);
+                if q.is_null() {
+                    r.finish(S2ERR_BAD_ARGUMENT, S2WERR_NULL_POINTER);
+                    return;
+                }
+                if caps.is_null() {
+                    r.finish(S2ERR_OUTOFSERVICE, S2WERR_GENERIC_ERROR);
+                    return;
+                }
+                let size = core::ptr::addr_of!((*q).s2xq_Size).read_unaligned() as usize;
+                // What fits: whole fields only, up to s2xq_Size bytes.
+                let ends = [8usize, 10, 12, 16, core::mem::size_of::<x::S2XQuery>()];
+                let fill = ends.iter().copied().filter(|&e| e <= size).max().unwrap_or(4);
+                let a = x::S2XQuery {
+                    s2xq_Size: size as u32,
+                    s2xq_Magic: x::S2X_MAGIC,
+                    s2xq_Version: x::S2X_VERSION,
+                    s2xq_Revision: S2X_REVISION,
+                    s2xq_Features: (*caps).features,
+                    s2xq_Capabilities: core::ptr::addr_of!((*caps).list),
+                };
+                if fill > 4 {
+                    core::ptr::copy_nonoverlapping((&a as *const x::S2XQuery as *const u8).add(4), (q as *mut u8).add(4), fill - 4);
+                }
+                r.finish(0, 0);
+            }
             S2_CONFIGINTERFACE | S2_ONLINE | S2_OFFLINE | S2_ADDMULTICASTADDRESS | S2_DELMULTICASTADDRESS
-            | S2_ADDMULTICASTADDRESSES | S2_DELMULTICASTADDRESSES | CMD_FLUSH => to_task(u, r),
+            | S2_ADDMULTICASTADDRESSES | S2_DELMULTICASTADDRESSES | CMD_FLUSH | x::S2X_CONFIGURE => to_task(u, r),
             #[cfg(feature = "diag")]
             E1000E_CMD_TESTFAULT | E1000E_CMD_DIAG | E1000E_CMD_TXMUTE | E1000E_CMD_TUNE | E1000E_CMD_ITR | E1000E_CMD_PRI => to_task(u, r),
             S2_SAMPLE_THROUGHPUT => {
@@ -3113,6 +4483,7 @@ pub extern "C" fn rust_dev_begin_io(ior: *mut IORequest) {
                     p(perf::RX_BY_WRITER),
                     p(perf::PRI_CHANGES),
                     p(perf::TX_DEFERRED),
+                    p(perf::TX_OFFLOADS),
                 ];
                 let hwc = u.shared.with(|s| s.hw);
                 let counts: Vec<u64> = counts.iter().copied().chain(hwc.iter().copied()).collect();
@@ -3237,28 +4608,44 @@ pub extern "C" fn rust_dev_abort_io(ior: *mut IORequest) {
             return;
         }
         let r = S2Req::from_raw(ior).unwrap();
+        // A read batch is replied with the frames it already holds counted
+        // (s2xb_Done), a write batch with the frames already taken. A read
+        // batch being filled right now is out of the list for that moment:
+        // the abort then finds nothing, and the batch is replied at the end
+        // of the receive pass anyway.
+        enum Found {
+            No,
+            Read(Rd),
+            Other,
+            Write(Tx),
+        }
         let found = u.shared.with(|s| {
-            for list in [&mut s.reads, &mut s.orphans, &mut s.events, &mut s.samples] {
-                if let Some(pos) = list.iter().position(|&x| x == r) {
+            if let Some(rd) = s.reads.iter().position(|rd| rd.r == r).and_then(|pos| s.reads.remove(pos)) {
+                return Found::Read(rd);
+            }
+            for list in [&mut s.orphans, &mut s.events, &mut s.samples] {
+                if let Some(pos) = list.iter().position(|&o| o == r) {
                     list.remove(pos);
-                    return true;
+                    return Found::Other;
                 }
             }
-            false
+            Found::No
         });
-        let found = found
-            || u.tx.with(|tx| {
-                let Some(tx) = tx.as_mut() else { return false };
-                match tx.pending.iter().position(|&x| x == r) {
-                    Some(pos) => {
-                        tx.pending.remove(pos);
-                        true
-                    }
-                    None => false,
+        let found = match found {
+            Found::No => u.tx.with(|tx| {
+                let Some(tx) = tx.as_mut() else { return Found::No };
+                match tx.pending.iter().position(|t| t.req() == r) {
+                    Some(pos) => Found::Write(tx.pending.remove(pos).unwrap()),
+                    None => Found::No,
                 }
-            });
-        if found {
-            r.reply(IOERR_ABORTED, 0);
+            }),
+            f => f,
+        };
+        match found {
+            Found::No => {}
+            Found::Read(rd) => rd.end(IOERR_ABORTED, 0),
+            Found::Other => r.reply(IOERR_ABORTED, 0),
+            Found::Write(t) => t.end(IOERR_ABORTED, 0),
         }
     }
 }

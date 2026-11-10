@@ -4,13 +4,14 @@ A network driver for AmigaOS 4.1 Final Edition that lets your Amiga use an
 **Intel 82574L gigabit Ethernet card**.
 
 It is a SANA-II driver: once it is installed, your TCP/IP stack (Roadshow,
-which comes with AmigaOS 4.1) can use the card like any other network
-card.
+which comes with AmigaOS 4.1, or [rustsocket](https://github.com/derfsss/RustSocket))
+can use the card like any other network card.
 
 > **Status: beta.** The driver passes all 32 checks of the SANA-II test
-> program s2test on QEMU (AmigaOne, Pegasos II and Sam460 machines). It has
-> not been tried on a real card yet. If you have one, your test results
-> are very welcome.
+> program s2test on QEMU (AmigaOne, Pegasos II and Sam460 machines), and
+> every check of the SANA-II extensions test s2xtest that applies to it.
+> It has not been tried on a real card yet. If you have one, your test
+> results are very welcome.
 
 
 ## Which cards work?
@@ -146,6 +147,27 @@ hardware, with scripts in `tools/bring-up/`.
 - Works on machines whose caches do not snoop PCI traffic.
 - Full SANA-II support: statistics, events, multicast, and promiscuous and
   exclusive modes.
+- The unofficial SANA-II extensions, for stacks that know them (such as
+  rustsocket 4.3): frames in batches, checksums checked and filled in by
+  the card, TCP segmentation, jumbo frames, and interrupt moderation and
+  flow control settings. Roadshow sees an ordinary SANA-II driver.
+  Details: [docs/sana2-extensions.md](docs/sana2-extensions.md).
+
+
+## Speed
+
+Measured on QEMU's AmigaOne with its emulated 82574L, against virtio-net in
+the same boot (QEMU's speed varies from boot to boot, so the ratio is what
+counts), netprof, every byte checked:
+
+| Stack | Receive | Send |
+|---|---|---|
+| rustsocket 4.3 (uses the SANA-II extensions) | 1.6-1.7 times virtio | 4.0-4.4 times virtio |
+| Roadshow 1.15 | about the same as virtio | 1.05-1.3 times virtio |
+
+With e1000e 0.1, which had no extensions, rustsocket received at the same
+speed as virtio and sent at 1.4 times it. Real cards have not been
+measured yet.
 
 
 ## Building from source
@@ -166,7 +188,37 @@ This builds `driver/e1000e.device`, `driver/e1000e_diag.device` and
 `diag/e1000e_diag`.
 
 Testing in QEMU: add `-netdev user,id=n1 -device e1000e,netdev=n1` to an
-AmigaOne, Pegasos II or Sam460 command line.
+AmigaOne, Pegasos II or Sam460 command line. The SANA-II checks are
+s2test ([VirtioRust](https://github.com/derfsss/VirtioRust),
+`testprogs/s2test`) and, for the extensions, s2xtest
+([RustSocket](https://github.com/derfsss/RustSocket),
+`testprogs/s2xtest`), which needs two cards linked to each other; see
+[docs/sana2-extensions.md](docs/sana2-extensions.md#testing).
+
+
+## Reporting a problem
+
+Please raise problems on the
+[GitHub issues page](https://github.com/derfsss/e1000e/issues).
+It helps to include:
+
+- **The machine and AmigaOS version**: for example an AmigaOne X5000 with
+  AmigaOS 4.1 Final Edition Update 3.
+- **The card**: its make and model, and the chip line from
+  `e1000e_diag RAW` (for example `8086:10d3`).
+- **The driver's version**: `Version DEVS:Networks/e1000e.device FULL` (or
+  `e1000e_diag.device`).
+- **The TCP/IP stack**: Roadshow or rustsocket, with its version
+  (`Version bsdsocket.library FULL`).
+- **What you did and what happened**: whether the device opens, whether
+  the link comes up, whether traffic flows, and what you expected.
+- **The diagnostics**: with the diagnostics build installed, the output
+  of `e1000e_diag` and the file `RAM:e1000e_diag.log`.
+- **The debug output**: straight after the problem, before rebooting,
+  `DumpDebugBuffer >RAM:debug.txt`, and attach the file (or the lines
+  that start with `e1000e`).
+- **For a crash**: the crash report (Grim Reaper's details, or the serial
+  output if you capture it).
 
 
 ## Licence

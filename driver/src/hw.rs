@@ -34,6 +34,7 @@ pub mod reg {
     pub const CTRL_EXT: u32 = 0x00018;
     pub const ICR: u32 = 0x000C0;
     pub const ITR: u32 = 0x000C4;
+    pub const RXCSUM: u32 = 0x05000;
     pub const IMS: u32 = 0x000D0;
     pub const IMC: u32 = 0x000D8;
     pub const RCTL: u32 = 0x00100;
@@ -212,6 +213,32 @@ pub mod bit {
     pub const RXD_STAT_EOP: u8 = 0x02;
     /// CE | SE | SEQ | CXE | RXE: a frame with any of these is bad.
     pub const RXD_ERR_FRAME: u8 = 0x01 | 0x02 | 0x04 | 0x10 | 0x80;
+    // Receive checksum results (legacy descriptor, RXCSUM IPOFL/TUOFL on):
+    // IPCS the IPv4 header was checked, TCPCS / UDPCS the TCP or UDP
+    // checksum was; IPE / TCPE (errors) say it was bad.
+    pub const RXD_STAT_IPCS: u8 = 0x40;
+    /// TCPCS | UDPCS: a TCP or UDP checksum was checked.
+    pub const RXD_STAT_L4I: u8 = 0x20 | 0x10;
+    pub const RXD_ERR_IPE: u8 = 0x40;
+    /// TCPE: the TCP or UDP checksum was bad.
+    pub const RXD_ERR_L4E: u8 = 0x20;
+    // RXCSUM
+    pub const RXCSUM_IPOFL: u32 = 0x0000_0100;
+    pub const RXCSUM_TUOFL: u32 = 0x0000_0200;
+    // TCP/IP context descriptor, TUCMD (the descriptor's byte 11): TCP
+    // (else UDP), IP (IPv4, else IPv6), TSE (segmentation), DEXT.
+    pub const TXCTX_TUCMD_TCP: u32 = 0x01;
+    pub const TXCTX_TUCMD_IP: u32 = 0x02;
+    pub const TXCTX_TUCMD_TSE: u32 = 0x04;
+    pub const TXCTX_TUCMD_DEXT: u32 = 0x20;
+    // TCP/IP data descriptor (extended): DTYP 1, DCMD EOP, IFCS, TSE, DEXT;
+    // POPTS (byte 13) IXSM (insert the IPv4 header checksum), TXSM (insert
+    // the TCP or UDP checksum).
+    pub const TXD_DTYP_DATA: u32 = 0x0010_0000;
+    pub const TXD_DCMD_TSE: u32 = 0x0400_0000;
+    pub const TXD_DCMD_DEXT: u32 = 0x2000_0000;
+    pub const TXD_POPTS_IXSM: u32 = 0x01;
+    pub const TXD_POPTS_TXSM: u32 = 0x02;
 }
 
 /// Bytes per legacy descriptor (receive and transmit).
@@ -585,7 +612,7 @@ impl Regs {
     ///
     /// # Safety
     /// As `r`; only the unit task (or setup) touches the PHY.
-    pub unsafe fn phy_setup(&self) -> PhySetup {
+    pub unsafe fn phy_setup(&self, pause: u16) -> PhySetup {
         // SAFETY: the caller's contract.
         let done = unsafe {
             self.with_mdio(|r| -> Option<PhySetup> {
@@ -605,7 +632,7 @@ impl Regs {
                 // left as it is (a PHY default; changing it alone would cost a
                 // restart, and the link partner never picks 1000 half anyway).
                 let want_gtc = gtc | phy::CR_1000T_FD_CAPS;
-                let want_adv = (adv & !phy::ADV_MASK) | phy::WANT_ADV;
+                let want_adv = (adv & !phy::ADV_MASK) | (phy::WANT_ADV & !(phy::AR_PAUSE | phy::AR_ASM_DIR)) | (pause & (phy::AR_PAUSE | phy::AR_ASM_DIR));
                 if adv != want_adv || gtc != want_gtc || cr & phy::CR_AUTO_NEG_EN == 0 {
                     if !r.phy_write(phy::AUTONEG_ADV, want_adv) || !r.phy_write(phy::GBIT_CTRL, want_gtc) {
                         return None;
@@ -717,15 +744,94 @@ impl Regs {
     ///
     /// # Safety
     /// As `r`; `phys` is a ring of `n` descriptors, 128-byte aligned.
-    pub unsafe fn rx_init(&self, phys: u32, n: usize, rctl_mode: u32) {
+    pub unsafe fn rx_queue_init(&self, q: usize, phys: u32, n: usize, _buf_size: usize) -> bool {
         // SAFETY: the caller's contract.
         unsafe {
+            debug_assert!(q == 0, "the 82574 is used with one receive queue");
             self.w(reg::RDBAL, phys);
             self.w(reg::RDBAH, 0);
             self.w(reg::RDLEN, (n * DESC_SIZE) as u32);
             self.w(reg::RDH, 0);
             self.w(reg::RDT, 0);
+        }
+        true
+    }
+
+    /// The receive tail register of queue `q` (only queue 0 here).
+    pub const fn rdt(_q: usize) -> u32 {
+        reg::RDT
+    }
+
+    /// Receive off (RCTL 0), before the ring is set up.
+    ///
+    /// # Safety
+    /// As `r`.
+    pub unsafe fn rx_stop(&self) {
+        // SAFETY: the caller's contract.
+        unsafe { self.w(reg::RCTL, 0) };
+    }
+
+    /// Start receiving with `rctl_mode` (buffer size bits, UPE/MPE) added,
+    /// with the card checking IPv4 header, TCP and UDP checksums.
+    ///
+    /// # Safety
+    /// As `r`; the ring is set up (`rx_queue_init`).
+    pub unsafe fn rx_enable(&self, rctl_mode: u32) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.w(reg::RXCSUM, bit::RXCSUM_IPOFL | bit::RXCSUM_TUOFL);
             self.w(reg::RCTL, bit::RCTL_EN | bit::RCTL_BAM | bit::RCTL_SECRC | bit::RCTL_SZ_2048 | rctl_mode);
+        }
+    }
+
+    /// The interrupt throttling interval (256 ns units, 0: off).
+    ///
+    /// # Safety
+    /// As `r`.
+    pub unsafe fn itr(&self) -> u32 {
+        // SAFETY: the caller's contract.
+        unsafe { self.r(reg::ITR) & 0xFFFF }
+    }
+
+    /// Set the interrupt throttling interval (256 ns units, 0: off).
+    ///
+    /// # Safety
+    /// As `r`.
+    pub unsafe fn set_itr(&self, v: u32) {
+        // SAFETY: the caller's contract.
+        unsafe { self.w(reg::ITR, v & 0xFFFF) };
+    }
+
+    /// Pause frames forced, not negotiated: obey them (`rx`) and send them
+    /// (`tx`) as given. Returns the mode, for the log.
+    ///
+    /// # Safety
+    /// As `r`.
+    pub unsafe fn fc_force(&self, rx: bool, tx: bool) -> &'static str {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let c = self.r(reg::CTRL) & !(bit::CTRL_RFCE | bit::CTRL_TFCE);
+            self.w(reg::CTRL, c | if rx { bit::CTRL_RFCE } else { 0 } | if tx { bit::CTRL_TFCE } else { 0 });
+        }
+        match (rx, tx) {
+            (true, true) => "flow control both ways (set)",
+            (true, false) => "flow control: obeys pause frames (set)",
+            (false, true) => "flow control: sends pause frames (set)",
+            (false, false) => "no flow control (set)",
+        }
+    }
+
+    /// After negotiation: turn off the directions the setting does not
+    /// allow.
+    ///
+    /// # Safety
+    /// As `r`.
+    pub unsafe fn fc_mask(&self, rx: bool, tx: bool) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let c = self.r(reg::CTRL);
+            let off = if rx { 0 } else { bit::CTRL_RFCE } | if tx { 0 } else { bit::CTRL_TFCE };
+            self.w(reg::CTRL, c & !off);
         }
     }
 
@@ -812,6 +918,57 @@ pub unsafe fn tx_desc_set(d: *mut u8, phys: u32, len: u16) {
         let lower = len as u32 | bit::TXD_CMD_EOP | bit::TXD_CMD_IFCS;
         core::ptr::copy_nonoverlapping(lower.to_le_bytes().as_ptr(), d.add(8), 4);
         core::ptr::write_bytes(d.add(12), 0, 4);
+    }
+}
+
+/// Write a TCP/IP context descriptor (the 82574's legacy offload context)
+/// for a frame whose IP header starts at `maclen` and is `iplen` long:
+/// the IPv4 header checksum over it (inserted at +10), and the TCP or UDP
+/// checksum (`tucmd` TCP or not) from the end of the IP header to the end
+/// of the frame, inserted at +16 or +6. With TSE (`mss` non-zero) the card
+/// cuts the `paylen` bytes after the `maclen + iplen + l4len` bytes of
+/// headers into `mss`-byte segments.
+///
+/// # Safety
+/// `d` points at a 16-byte descriptor.
+pub unsafe fn tx_ctx_set(d: *mut u8, maclen: u32, iplen: u32, tucmd: u32, mss: u32, l4len: u32, paylen: u32) {
+    let ipcss = maclen;
+    let tucss = maclen + iplen;
+    let tucso = tucss + if tucmd & bit::TXCTX_TUCMD_TCP != 0 { 16 } else { 6 };
+    let ipcse = (maclen + iplen).saturating_sub(1);
+    let mut cmd = tucmd | bit::TXCTX_TUCMD_DEXT;
+    let mut hdr = 0;
+    if mss != 0 {
+        cmd |= bit::TXCTX_TUCMD_TSE;
+        hdr = maclen + iplen + l4len;
+    }
+    let w0 = (ipcss & 0xFF) | (((ipcss + 10) & 0xFF) << 8) | ((ipcse & 0xFFFF) << 16);
+    let w1 = (tucss & 0xFF) | ((tucso & 0xFF) << 8);
+    let w2 = (paylen & 0xF_FFFF) | ((cmd & 0xFF) << 24);
+    let w3 = ((hdr & 0xFF) << 8) | ((mss & 0xFFFF) << 16);
+    // SAFETY: the caller's contract.
+    unsafe {
+        for (k, w) in [w0, w1, w2, w3].iter().enumerate() {
+            core::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), d.add(4 * k), 4);
+        }
+    }
+}
+
+/// Write a TCP/IP data descriptor (extended): `len` bytes at `phys`, the
+/// whole frame, with the checksums `popts` asks for (IXSM, TXSM) and TSE
+/// when the context asked for segmentation. No status write-back.
+///
+/// # Safety
+/// `d` points at a 16-byte descriptor.
+pub unsafe fn tx_desc_set_offload(d: *mut u8, phys: u32, len: u32, popts: u32, tse: bool) {
+    let lower = (len & 0xF_FFFF) | bit::TXD_DTYP_DATA | bit::TXD_DCMD_DEXT | bit::TXD_CMD_EOP | bit::TXD_CMD_IFCS
+        | if tse { bit::TXD_DCMD_TSE } else { 0 };
+    let upper = (popts & 0xFF) << 8;
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping((phys as u64).to_le_bytes().as_ptr(), d, 8);
+        core::ptr::copy_nonoverlapping(lower.to_le_bytes().as_ptr(), d.add(8), 4);
+        core::ptr::copy_nonoverlapping(upper.to_le_bytes().as_ptr(), d.add(12), 4);
     }
 }
 

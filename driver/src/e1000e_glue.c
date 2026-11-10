@@ -30,16 +30,16 @@
 /* The diag build: private diagnostic, tuning and test commands, transmit
  * batching, jumbo frames, the RAM: extras log (which needs DOS). */
 #define DEVNAME    "e1000e_diag.device"
-#define VSTRING    "e1000e_diag.device 0.1 (08.11.2026)"
+#define VSTRING    "e1000e_diag.device 0.2 (10.11.2026)"
 #else
 #define DEVNAME    "e1000e.device"
-#define VSTRING    "e1000e.device 0.1 (08.11.2026)"
+#define VSTRING    "e1000e.device 0.2 (10.11.2026)"
 #endif
 #ifndef GIT_HASH
 #define GIT_HASH   "unknown"
 #endif
 #define DEVVER     0
-#define DEVREV     1
+#define DEVREV     2
 #define DEVPRI     0
 
 /* Read by the amigaos4 crate (sys::IExec, sys::IPCI, sys::IUtility). */
